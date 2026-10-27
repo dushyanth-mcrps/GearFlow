@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '../../.env') });
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 require('dotenv').config();
@@ -51,6 +52,18 @@ app.use('/api/assets', assetRoutes);
 app.use('/api/reservations', reservationRoutes);
 app.use('/api/maintenance', maintenanceRoutes);
 app.use('/api/stats', statsRoutes);
+
+// Serve static client assets in production
+const clientDistPath = path.join(__dirname, '../../client/dist');
+if (fs.existsSync(clientDistPath)) {
+  app.use(express.static(clientDistPath));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) {
+      return next();
+    }
+    res.sendFile(path.join(clientDistPath, 'index.html'));
+  });
+}
 
 // Global 404 handler for unmatched routes
 app.use((req, res) => {

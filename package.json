@@ -9,6 +9,8 @@
     "server": "npm --prefix server start",
     "client": "npm --prefix client run dev",
     "dev": "concurrently -n \"SERVER,CLIENT\" -c \"blue,green\" \"npm run server\" \"npm run client\"",
+    "build": "npm --prefix client run build",
+    "prod": "npm run build && node server/src/index.js",
     "start": "npm run dev",
     "test": "npm --prefix server test",
     "verify": "node server/test/verifySystem.js"
