@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const { getDb } = require('./db/connection');
+const { connectMongo, getMongoStatus } = require('./db/mongoConnection');
 
 // Import routes
 const authRoutes = require('./routes/authRoutes');
@@ -32,9 +33,12 @@ app.use((req, res, next) => {
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
+  const mongoStatus = getMongoStatus();
   res.json({
     status: 'healthy',
     product: 'GearFlow Enterprise Asset Lending Platform',
+    databaseEngine: mongoStatus.isConnected ? 'MongoDB (Mongoose)' : 'SQLite (better-sqlite3)',
+    mongoConnected: mongoStatus.isConnected,
     timestamp: new Date().toISOString()
   });
 });
@@ -60,14 +64,24 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Initialize DB schema automatically
-getDb();
+// Initialize database engines
+async function startServer() {
+  if (process.env.MONGODB_URI && process.env.MONGODB_URI.trim()) {
+    console.log('📡 MONGODB_URI detected. Initializing MongoDB connection...');
+    await connectMongo(process.env.MONGODB_URI);
+  }
+  getDb();
 
-if (process.env.NODE_ENV !== 'test') {
-  app.listen(PORT, () => {
-    console.log(`🚀 GearFlow API Server active on http://localhost:${PORT}`);
-    console.log(`📡 Ready for reservations, custody workflows, and quarantine management.`);
-  });
+  if (process.env.NODE_ENV !== 'test') {
+    app.listen(PORT, () => {
+      console.log(`🚀 GearFlow API Server active on http://localhost:${PORT}`);
+      const mongoStatus = getMongoStatus();
+      console.log(`💾 Active Database Engine: ${mongoStatus.isConnected ? 'MongoDB (Atlas/Mongoose)' : 'SQLite WAL (local)'}`);
+      console.log(`📡 Ready for reservations, custody workflows, and quarantine management.`);
+    });
+  }
 }
+
+startServer();
 
 module.exports = app;

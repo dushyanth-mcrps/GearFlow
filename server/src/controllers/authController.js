@@ -2,8 +2,14 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { getDb } = require('../db/connection');
 const { JWT_SECRET } = require('../middleware/auth');
+const User = require('../models/User');
+const mongoose = require('mongoose');
 
-function register(req, res) {
+function isMongo() {
+  return mongoose.connection && mongoose.connection.readyState === 1;
+}
+
+async function register(req, res) {
   try {
     const { name, email, password, role = 'borrower', department, phone } = req.body;
 
@@ -20,8 +26,42 @@ function register(req, res) {
       return res.status(400).json({ error: 'Invalid user role' });
     }
 
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // MongoDB Flow
+    if (isMongo()) {
+      const existing = await User.findOne({ email: normalizedEmail });
+      if (existing) {
+        return res.status(409).json({ error: 'User with this email already exists' });
+      }
+
+      const hashedPassword = bcrypt.hashSync(password, 10);
+      const createdUser = await User.create({
+        name: name.trim(),
+        email: normalizedEmail,
+        password: hashedPassword,
+        role,
+        department: department || null,
+        phone: phone || null,
+        depositBalance: 250.0
+      });
+
+      const token = jwt.sign(
+        { id: createdUser._id.toString(), email: createdUser.email, role: createdUser.role, name: createdUser.name },
+        JWT_SECRET,
+        { expiresIn: '7d' }
+      );
+
+      return res.status(201).json({
+        message: 'User registered successfully in MongoDB',
+        token,
+        user: createdUser.toJSON()
+      });
+    }
+
+    // SQLite Fallback Flow
     const db = getDb();
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase().trim());
+    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail);
     if (existing) {
       return res.status(409).json({ error: 'User with this email already exists' });
     }
@@ -30,12 +70,12 @@ function register(req, res) {
     const result = db.prepare(`
       INSERT INTO users (name, email, password, role, department, phone, depositBalance)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(name.trim(), email.toLowerCase().trim(), hashedPassword, role, department || null, phone || null, 250.0);
+    `).run(name.trim(), normalizedEmail, hashedPassword, role, department || null, phone || null, 250.0);
 
     const user = {
       id: result.lastInsertRowid,
       name: name.trim(),
-      email: email.toLowerCase().trim(),
+      email: normalizedEmail,
       role,
       department: department || null,
       phone: phone || null,
@@ -59,7 +99,7 @@ function register(req, res) {
   }
 }
 
-function login(req, res) {
+async function login(req, res) {
   try {
     const { email, password } = req.body;
 
@@ -67,8 +107,36 @@ function login(req, res) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // MongoDB Flow
+    if (isMongo()) {
+      const user = await User.findOne({ email: normalizedEmail });
+      if (!user) {
+        return res.status(401).json({ error: 'Invalid email or password' });
+      }
+
+      const match = bcrypt.compareSync(password, user.password);
+      if (!match) {
+        return res.status(401).json({ error: 'Invalid email or password' });
+      }
+
+      const token = jwt.sign(
+        { id: user._id.toString(), email: user.email, role: user.role, name: user.name },
+        JWT_SECRET,
+        { expiresIn: '7d' }
+      );
+
+      return res.json({
+        message: 'Login successful (MongoDB)',
+        token,
+        user: user.toJSON()
+      });
+    }
+
+    // SQLite Fallback Flow
     const db = getDb();
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase().trim());
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(normalizedEmail);
 
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
@@ -98,8 +166,16 @@ function login(req, res) {
   }
 }
 
-function getProfile(req, res) {
+async function getProfile(req, res) {
   try {
+    if (isMongo()) {
+      const user = await User.findById(req.user.id);
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      return res.json({ user: user.toJSON() });
+    }
+
     const db = getDb();
     const user = db.prepare('SELECT id, name, email, role, department, phone, depositBalance, createdAt FROM users WHERE id = ?').get(req.user.id);
     if (!user) {
@@ -112,8 +188,13 @@ function getProfile(req, res) {
   }
 }
 
-function getAllUsers(req, res) {
+async function getAllUsers(req, res) {
   try {
+    if (isMongo()) {
+      const users = await User.find().sort({ name: 1 });
+      return res.json({ users: users.map(u => u.toJSON()) });
+    }
+
     const db = getDb();
     const users = db.prepare('SELECT id, name, email, role, department, phone, depositBalance, createdAt FROM users ORDER BY name ASC').all();
     return res.json({ users });
