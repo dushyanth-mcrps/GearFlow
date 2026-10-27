@@ -1,10 +1,58 @@
 const { getDb } = require('../db/connection');
+const mongoose = require('mongoose');
+const MaintenanceTicket = require('../models/MaintenanceTicket');
+const Asset = require('../models/Asset');
+const AuditLog = require('../models/AuditLog');
 
-function getAllTickets(req, res) {
+function isMongo() {
+  return mongoose.connection && mongoose.connection.readyState === 1;
+}
+
+async function getAllTickets(req, res) {
   try {
-    const db = getDb();
     const { status, severity, assetId } = req.query;
 
+    if (isMongo()) {
+      const filter = {};
+      if (status && status !== 'All') filter.status = status;
+      if (severity && severity !== 'All') filter.severity = severity;
+      if (assetId) filter.assetId = assetId;
+
+      const tickets = await MaintenanceTicket.find(filter)
+        .populate('assetId')
+        .populate('reportedBy', 'name email')
+        .sort({ createdAt: -1 });
+
+      const parsed = tickets.map(t => {
+        const asset = t.assetId || {};
+        return {
+          id: t._id.toString(),
+          _id: t._id.toString(),
+          assetId: asset._id ? asset._id.toString() : t.assetId,
+          assetName: asset.name,
+          assetTag: asset.assetTag,
+          assetCategory: asset.category,
+          assetLocation: asset.location,
+          assetImage: asset.imageUrl,
+          reportedBy: t.reportedBy?._id?.toString() || t.reportedBy,
+          reporterName: t.reportedBy?.name,
+          reporterEmail: t.reportedBy?.email,
+          reservationId: t.reservationId?.toString(),
+          issueDescription: t.issueDescription,
+          severity: t.severity,
+          status: t.status,
+          assignedTo: t.assignedTo,
+          estimatedRepairCost: t.estimatedRepairCost,
+          resolutionNotes: t.resolutionNotes,
+          resolvedAt: t.resolvedAt,
+          createdAt: t.createdAt
+        };
+      });
+
+      return res.json({ tickets: parsed });
+    }
+
+    const db = getDb();
     let query = `
       SELECT t.*,
              a.name as assetName, a.assetTag, a.category as assetCategory, a.location as assetLocation, a.imageUrl as assetImage,
@@ -41,11 +89,43 @@ function getAllTickets(req, res) {
   }
 }
 
-function getTicketById(req, res) {
+async function getTicketById(req, res) {
   try {
-    const db = getDb();
     const { id } = req.params;
 
+    if (isMongo()) {
+      const t = await MaintenanceTicket.findById(id)
+        .populate('assetId')
+        .populate('reportedBy', 'name email');
+
+      if (!t) return res.status(404).json({ error: 'Maintenance ticket not found' });
+      const asset = t.assetId || {};
+      return res.json({
+        ticket: {
+          id: t._id.toString(),
+          _id: t._id.toString(),
+          assetId: asset._id ? asset._id.toString() : t.assetId,
+          assetName: asset.name,
+          assetTag: asset.assetTag,
+          assetCategory: asset.category,
+          assetLocation: asset.location,
+          assetImage: asset.imageUrl,
+          reporterName: t.reportedBy?.name,
+          reporterEmail: t.reportedBy?.email,
+          reservationId: t.reservationId?.toString(),
+          issueDescription: t.issueDescription,
+          severity: t.severity,
+          status: t.status,
+          assignedTo: t.assignedTo,
+          estimatedRepairCost: t.estimatedRepairCost,
+          resolutionNotes: t.resolutionNotes,
+          resolvedAt: t.resolvedAt,
+          createdAt: t.createdAt
+        }
+      });
+    }
+
+    const db = getDb();
     const ticket = db.prepare(`
       SELECT t.*,
              a.name as assetName, a.assetTag, a.category as assetCategory, a.location as assetLocation, a.imageUrl as assetImage,
@@ -67,9 +147,7 @@ function getTicketById(req, res) {
   }
 }
 
-function createTicket(req, res) {
-  const db = getDb();
-
+async function createTicket(req, res) {
   try {
     const { assetId, issueDescription, severity = 'MEDIUM', estimatedRepairCost = 0.0, assignedTo } = req.body;
 
@@ -77,13 +155,46 @@ function createTicket(req, res) {
       return res.status(400).json({ error: 'assetId and issueDescription are required' });
     }
 
+    if (isMongo()) {
+      const asset = await Asset.findById(assetId);
+      if (!asset) return res.status(404).json({ error: 'Asset not found' });
+
+      const ticket = await MaintenanceTicket.create({
+        assetId,
+        reportedBy: req.user.id,
+        issueDescription: issueDescription.trim(),
+        severity,
+        status: 'OPEN',
+        assignedTo: assignedTo || 'Unassigned',
+        estimatedRepairCost: parseFloat(estimatedRepairCost) || 0.0
+      });
+
+      asset.status = 'MAINTENANCE';
+      asset.conditionGrade = 'DAMAGED';
+      await asset.save();
+
+      await AuditLog.create({
+        actorId: req.user.id,
+        actorName: req.user.name,
+        action: 'MAINTENANCE_TICKET_OPENED',
+        targetType: 'MAINTENANCE',
+        targetId: ticket._id.toString(),
+        details: `Opened maintenance ticket #${ticket._id.toString()} for ${asset.assetTag}. Severity: ${severity}. Locked into quarantine.`
+      });
+
+      return res.status(201).json({
+        message: 'Maintenance ticket created. Asset quarantined.',
+        ticketId: ticket._id.toString()
+      });
+    }
+
+    const db = getDb();
     const asset = db.prepare('SELECT id, assetTag, name FROM assets WHERE id = ?').get(assetId);
     if (!asset) {
       return res.status(404).json({ error: 'Asset not found' });
     }
 
     const ticketTx = db.transaction(() => {
-      // 1. Create ticket
       const result = db.prepare(`
         INSERT INTO maintenance_tickets (assetId, reportedBy, issueDescription, severity, status, assignedTo, estimatedRepairCost)
         VALUES (?, ?, ?, ?, 'OPEN', ?, ?)
@@ -97,11 +208,8 @@ function createTicket(req, res) {
       );
 
       const ticketId = result.lastInsertRowid;
-
-      // 2. Put asset into MAINTENANCE status
       db.prepare("UPDATE assets SET status = 'MAINTENANCE', conditionGrade = 'DAMAGED' WHERE id = ?").run(assetId);
 
-      // 3. Audit log
       db.prepare(`
         INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
         VALUES (?, ?, 'MAINTENANCE_TICKET_OPENED', 'MAINTENANCE', ?, ?)
@@ -126,9 +234,7 @@ function createTicket(req, res) {
   }
 }
 
-function updateTicket(req, res) {
-  const db = getDb();
-
+async function updateTicket(req, res) {
   try {
     const { id } = req.params;
     const {
@@ -140,6 +246,48 @@ function updateTicket(req, res) {
       restoredConditionGrade = 'GOOD'
     } = req.body;
 
+    if (isMongo()) {
+      const ticket = await MaintenanceTicket.findById(id);
+      if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+
+      if (status) ticket.status = status;
+      if (assignedTo !== undefined) ticket.assignedTo = assignedTo;
+      if (estimatedRepairCost !== undefined) ticket.estimatedRepairCost = parseFloat(estimatedRepairCost);
+      if (resolutionNotes !== undefined) ticket.resolutionNotes = resolutionNotes;
+      if (status === 'RESOLVED' || status === 'CLOSED') {
+        ticket.resolvedAt = new Date();
+      }
+      await ticket.save();
+
+      let restoredTag = null;
+      if (restoreAsset || status === 'RESOLVED' || status === 'CLOSED') {
+        const asset = await Asset.findById(ticket.assetId);
+        if (asset) {
+          asset.status = 'AVAILABLE';
+          asset.conditionGrade = restoredConditionGrade;
+          await asset.save();
+          restoredTag = asset.assetTag;
+        }
+      }
+
+      await AuditLog.create({
+        actorId: req.user.id,
+        actorName: req.user.name,
+        action: 'MAINTENANCE_TICKET_UPDATED',
+        targetType: 'MAINTENANCE',
+        targetId: id,
+        details: `Updated ticket #${id}. Status: ${ticket.status}. ${restoredTag ? `Asset ${restoredTag} released from quarantine.` : ''}`
+      });
+
+      return res.json({
+        message: 'Ticket updated successfully',
+        ticketId: id,
+        status: ticket.status,
+        assetRestored: !!restoredTag
+      });
+    }
+
+    const db = getDb();
     const ticket = db.prepare('SELECT * FROM maintenance_tickets WHERE id = ?').get(id);
     if (!ticket) {
       return res.status(404).json({ error: 'Ticket not found' });
@@ -159,28 +307,19 @@ function updateTicket(req, res) {
       `).run(
         status,
         assignedTo,
-        estimatedRepairCost !== undefined ? parseFloat(estimatedRepairCost) : undefined,
+        estimatedRepairCost !== undefined ? parseFloat(estimatedRepairCost) : null,
         resolutionNotes,
         resolvedAt,
         id
       );
 
-      // If resolved and requested to restore, set asset back to AVAILABLE
-      if (restoreAsset && (status === 'RESOLVED' || status === 'CLOSED')) {
-        db.prepare("UPDATE assets SET status = 'AVAILABLE', conditionGrade = ? WHERE id = ?").run(
-          restoredConditionGrade,
-          ticket.assetId
-        );
-
-        db.prepare(`
-          INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
-          VALUES (?, ?, 'MAINTENANCE_RESTORED', 'ASSET', ?, ?)
-        `).run(
-          req.user.id,
-          req.user.name,
-          ticket.assetId,
-          `Asset restored to service from maintenance ticket #${id}. Condition: ${restoredConditionGrade}.`
-        );
+      let restoredTag = null;
+      if (restoreAsset || status === 'RESOLVED' || status === 'CLOSED') {
+        const asset = db.prepare('SELECT id, assetTag FROM assets WHERE id = ?').get(ticket.assetId);
+        if (asset) {
+          db.prepare("UPDATE assets SET status = 'AVAILABLE', conditionGrade = ? WHERE id = ?").run(restoredConditionGrade, asset.id);
+          restoredTag = asset.assetTag;
+        }
       }
 
       db.prepare(`
@@ -190,15 +329,22 @@ function updateTicket(req, res) {
         req.user.id,
         req.user.name,
         id,
-        `Updated ticket #${id}. Status: ${status || ticket.status}. Assigned to: ${assignedTo || ticket.assignedTo}`
+        `Updated ticket #${id}. Status: ${status || ticket.status}. ${restoredTag ? `Asset ${restoredTag} released from quarantine.` : ''}`
       );
+
+      return { restoredTag };
     });
 
-    updateTx();
-    return res.json({ message: 'Maintenance ticket updated successfully' });
+    const result = updateTx();
+    return res.json({
+      message: 'Ticket updated successfully',
+      ticketId: id,
+      status: status || ticket.status,
+      assetRestored: !!result.restoredTag
+    });
   } catch (error) {
     console.error('Update ticket error:', error);
-    return res.status(500).json({ error: 'Failed to update ticket' });
+    return res.status(500).json({ error: 'Failed to update maintenance ticket' });
   }
 }
 

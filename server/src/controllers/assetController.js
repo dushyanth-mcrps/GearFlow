@@ -1,10 +1,36 @@
 const { getDb } = require('../db/connection');
+const mongoose = require('mongoose');
+const Asset = require('../models/Asset');
+const Reservation = require('../models/Reservation');
+const MaintenanceTicket = require('../models/MaintenanceTicket');
+const AuditLog = require('../models/AuditLog');
 
-function getAllAssets(req, res) {
+function isMongo() {
+  return mongoose.connection && mongoose.connection.readyState === 1;
+}
+
+async function getAllAssets(req, res) {
   try {
-    const db = getDb();
     const { search, category, status, conditionGrade } = req.query;
 
+    if (isMongo()) {
+      const filter = {};
+      if (search) {
+        filter.$or = [
+          { name: { $regex: search, $options: 'i' } },
+          { assetTag: { $regex: search, $options: 'i' } },
+          { description: { $regex: search, $options: 'i' } }
+        ];
+      }
+      if (category && category !== 'All') filter.category = category;
+      if (status && status !== 'All') filter.status = status;
+      if (conditionGrade && conditionGrade !== 'All') filter.conditionGrade = conditionGrade;
+
+      const assets = await Asset.find(filter).sort({ createdAt: 1 });
+      return res.json({ assets: assets.map(a => a.toJSON()) });
+    }
+
+    const db = getDb();
     let query = 'SELECT * FROM assets WHERE 1=1';
     const params = [];
 
@@ -45,11 +71,40 @@ function getAllAssets(req, res) {
   }
 }
 
-function getAssetById(req, res) {
+async function getAssetById(req, res) {
   try {
-    const db = getDb();
     const { id } = req.params;
 
+    if (isMongo()) {
+      const asset = await Asset.findById(id);
+      if (!asset) {
+        return res.status(404).json({ error: 'Asset not found' });
+      }
+
+      const reservations = await Reservation.find({
+        assetId: id,
+        status: { $in: ['CONFIRMED', 'CHECKED_OUT'] }
+      }).populate('userId', 'name email').sort({ startTime: 1 });
+
+      const tickets = await MaintenanceTicket.find({ assetId: id })
+        .populate('reportedBy', 'name email')
+        .sort({ createdAt: -1 });
+
+      return res.json({
+        asset: asset.toJSON(),
+        activeReservations: reservations.map(r => ({
+          ...r.toJSON(),
+          userName: r.userId?.name,
+          userEmail: r.userId?.email
+        })),
+        maintenanceTickets: tickets.map(t => ({
+          ...t.toJSON(),
+          reporterName: t.reportedBy?.name
+        }))
+      });
+    }
+
+    const db = getDb();
     const asset = db.prepare('SELECT * FROM assets WHERE id = ?').get(id);
     if (!asset) {
       return res.status(404).json({ error: 'Asset not found' });
@@ -85,9 +140,8 @@ function getAssetById(req, res) {
   }
 }
 
-function checkAvailability(req, res) {
+async function checkAvailability(req, res) {
   try {
-    const db = getDb();
     const { id } = req.params;
     const { startTime, endTime, excludeReservationId } = req.query;
 
@@ -95,13 +149,51 @@ function checkAvailability(req, res) {
       return res.status(400).json({ error: 'startTime and endTime query parameters are required' });
     }
 
-    const start = new Date(startTime).toISOString();
-    const end = new Date(endTime).toISOString();
+    const start = new Date(startTime);
+    const end = new Date(endTime);
 
     if (start >= end) {
       return res.status(400).json({ error: 'startTime must be strictly before endTime' });
     }
 
+    if (isMongo()) {
+      const asset = await Asset.findById(id);
+      if (!asset) {
+        return res.status(404).json({ error: 'Asset not found' });
+      }
+
+      if (asset.status === 'MAINTENANCE' || asset.status === 'DECOMMISSIONED') {
+        return res.json({
+          available: false,
+          reason: `Asset is currently under ${asset.status} lock and cannot be booked.`,
+          conflicts: []
+        });
+      }
+
+      const conflictFilter = {
+        assetId: id,
+        status: { $in: ['CONFIRMED', 'CHECKED_OUT'] },
+        $or: [
+          { startTime: { $lte: start }, endTime: { $gt: start } },
+          { startTime: { $lt: end }, endTime: { $gte: end } },
+          { startTime: { $gte: start }, endTime: { $lte: end } }
+        ]
+      };
+
+      if (excludeReservationId) {
+        conflictFilter._id = { $ne: excludeReservationId };
+      }
+
+      const conflicts = await Reservation.find(conflictFilter);
+
+      return res.json({
+        available: conflicts.length === 0,
+        conflicts: conflicts.map(c => c.toJSON()),
+        reason: conflicts.length === 0 ? 'Slot is available for booking' : 'Overlaps with existing confirmed/active booking'
+      });
+    }
+
+    const db = getDb();
     const asset = db.prepare('SELECT id, name, status, conditionGrade FROM assets WHERE id = ?').get(id);
     if (!asset) {
       return res.status(404).json({ error: 'Asset not found' });
@@ -115,6 +207,9 @@ function checkAvailability(req, res) {
       });
     }
 
+    const startIso = start.toISOString();
+    const endIso = end.toISOString();
+
     let conflictQuery = `
       SELECT id, startTime, endTime, status
       FROM reservations
@@ -126,7 +221,7 @@ function checkAvailability(req, res) {
           (startTime >= ? AND endTime <= ?)
         )
     `;
-    const params = [id, start, start, end, end, start, end];
+    const params = [id, startIso, startIso, endIso, endIso, startIso, endIso];
 
     if (excludeReservationId) {
       conflictQuery += ' AND id != ?';
@@ -146,9 +241,8 @@ function checkAvailability(req, res) {
   }
 }
 
-function createAsset(req, res) {
+async function createAsset(req, res) {
   try {
-    const db = getDb();
     const {
       assetTag,
       name,
@@ -166,6 +260,42 @@ function createAsset(req, res) {
       return res.status(400).json({ error: 'assetTag, name, and category are required' });
     }
 
+    if (isMongo()) {
+      const existing = await Asset.findOne({ assetTag: assetTag.trim().toUpperCase() });
+      if (existing) {
+        return res.status(409).json({ error: 'Asset with this assetTag already exists' });
+      }
+
+      const asset = await Asset.create({
+        assetTag: assetTag.trim().toUpperCase(),
+        name: name.trim(),
+        category: category.trim(),
+        description: description || '',
+        imageUrl: imageUrl || '',
+        conditionGrade,
+        hourlyPenaltyRate,
+        replacementCost,
+        accessories: Array.isArray(accessories) ? accessories : [],
+        location
+      });
+
+      await AuditLog.create({
+        actorId: req.user.id,
+        actorName: req.user.name,
+        action: 'ASSET_CREATED',
+        targetType: 'ASSET',
+        targetId: asset._id.toString(),
+        details: `Created new asset ${asset.assetTag}: ${asset.name}`
+      });
+
+      return res.status(201).json({
+        message: 'Asset created successfully',
+        asset: asset.toJSON(),
+        assetId: asset._id.toString()
+      });
+    }
+
+    const db = getDb();
     const existing = db.prepare('SELECT id FROM assets WHERE assetTag = ?').get(assetTag.trim());
     if (existing) {
       return res.status(409).json({ error: 'Asset with this assetTag already exists' });
@@ -187,7 +317,6 @@ function createAsset(req, res) {
       location
     );
 
-    // Audit log
     db.prepare(`
       INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
       VALUES (?, ?, 'ASSET_CREATED', 'ASSET', ?, ?)
@@ -208,12 +337,40 @@ function createAsset(req, res) {
   }
 }
 
-function updateAsset(req, res) {
+async function updateAsset(req, res) {
   try {
-    const db = getDb();
     const { id } = req.params;
     const { name, category, description, imageUrl, conditionGrade, status, hourlyPenaltyRate, replacementCost, accessories, location } = req.body;
 
+    if (isMongo()) {
+      const updateData = {};
+      if (name) updateData.name = name;
+      if (category) updateData.category = category;
+      if (description !== undefined) updateData.description = description;
+      if (imageUrl !== undefined) updateData.imageUrl = imageUrl;
+      if (conditionGrade) updateData.conditionGrade = conditionGrade;
+      if (status) updateData.status = status;
+      if (hourlyPenaltyRate !== undefined) updateData.hourlyPenaltyRate = hourlyPenaltyRate;
+      if (replacementCost !== undefined) updateData.replacementCost = replacementCost;
+      if (accessories) updateData.accessories = accessories;
+      if (location) updateData.location = location;
+
+      const asset = await Asset.findByIdAndUpdate(id, updateData, { new: true });
+      if (!asset) return res.status(404).json({ error: 'Asset not found' });
+
+      await AuditLog.create({
+        actorId: req.user.id,
+        actorName: req.user.name,
+        action: 'ASSET_UPDATED',
+        targetType: 'ASSET',
+        targetId: asset._id.toString(),
+        details: `Updated asset ${asset.assetTag}`
+      });
+
+      return res.json({ message: 'Asset updated successfully', asset: asset.toJSON() });
+    }
+
+    const db = getDb();
     const existing = db.prepare('SELECT * FROM assets WHERE id = ?').get(id);
     if (!existing) {
       return res.status(404).json({ error: 'Asset not found' });
@@ -246,7 +403,6 @@ function updateAsset(req, res) {
       id
     );
 
-    // Audit log
     db.prepare(`
       INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
       VALUES (?, ?, 'ASSET_UPDATED', 'ASSET', ?, ?)
@@ -264,8 +420,20 @@ function updateAsset(req, res) {
   }
 }
 
-function getCategories(req, res) {
+async function getCategories(req, res) {
   try {
+    if (isMongo()) {
+      const distinctCategories = await Asset.distinct('category');
+      const counts = await Promise.all(
+        distinctCategories.map(async cat => ({
+          category: cat,
+          count: await Asset.countDocuments({ category: cat })
+        }))
+      );
+      counts.sort((a, b) => b.count - a.count);
+      return res.json({ categories: counts });
+    }
+
     const db = getDb();
     const categories = db.prepare(`
       SELECT category, COUNT(*) as count

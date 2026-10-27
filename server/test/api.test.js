@@ -1,6 +1,7 @@
 const assert = require('assert');
 const path = require('path');
 const fs = require('fs');
+const mongoose = require('mongoose');
 
 // Use isolated test database
 const TEST_DB = path.join(__dirname, 'test_gearflow.sqlite');
@@ -159,10 +160,14 @@ async function runTests() {
     console.error('❌ Test failed:', err);
     process.exitCode = 1;
   } finally {
-    server.close();
+    if (server) server.close();
+    if (mongoose.connection && mongoose.connection.readyState !== 0) {
+      try { await mongoose.disconnect(); } catch (_) {}
+    }
     if (fs.existsSync(TEST_DB)) {
       try { fs.unlinkSync(TEST_DB); } catch (_) {}
     }
+    process.exit(process.exitCode || 0);
   }
 }
 

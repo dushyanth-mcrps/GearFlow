@@ -1,7 +1,26 @@
 const { getDb } = require('../db/connection');
+const mongoose = require('mongoose');
+const Reservation = require('../models/Reservation');
+const Asset = require('../models/Asset');
+const User = require('../models/User');
+const MaintenanceTicket = require('../models/MaintenanceTicket');
+const AuditLog = require('../models/AuditLog');
+
+function isMongo() {
+  return mongoose.connection && mongoose.connection.readyState === 1;
+}
 
 // Automatically checks and marks overdue checkouts
-function syncOverdueReservations(db) {
+async function syncOverdueReservations() {
+  if (isMongo()) {
+    const now = new Date();
+    await Reservation.updateMany(
+      { status: 'CHECKED_OUT', endTime: { $lt: now } },
+      { $set: { status: 'OVERDUE' } }
+    );
+    return;
+  }
+  const db = getDb();
   const now = new Date().toISOString();
   db.prepare(`
     UPDATE reservations
@@ -10,12 +29,86 @@ function syncOverdueReservations(db) {
   `).run(now);
 }
 
-function getAllReservations(req, res) {
+async function getAllReservations(req, res) {
   try {
-    const db = getDb();
-    syncOverdueReservations(db);
+    await syncOverdueReservations();
 
     const { status, assetId, userId } = req.query;
+
+    if (isMongo()) {
+      const filter = {};
+      if (req.user.role === 'borrower') {
+        filter.userId = req.user.id;
+      } else if (userId) {
+        filter.userId = userId;
+      }
+
+      if (status && status !== 'All') {
+        filter.status = status;
+      }
+
+      if (assetId) {
+        filter.assetId = assetId;
+      }
+
+      const reservations = await Reservation.find(filter)
+        .populate('assetId')
+        .populate('userId', 'name email phone department depositBalance')
+        .populate('checkedOutBy', 'name')
+        .populate('receivedBy', 'name')
+        .sort({ createdAt: -1 });
+
+      const now = new Date();
+      const parsed = reservations.map(r => {
+        const end = new Date(r.endTime);
+        let hoursOverdue = 0;
+        if ((r.status === 'CHECKED_OUT' || r.status === 'OVERDUE') && now > end) {
+          hoursOverdue = Math.ceil((now - end) / (1000 * 60 * 60));
+        }
+
+        const asset = r.assetId || {};
+        const borrower = r.userId || {};
+
+        return {
+          id: r._id.toString(),
+          _id: r._id.toString(),
+          assetId: asset._id ? asset._id.toString() : r.assetId,
+          assetName: asset.name || 'Unknown Asset',
+          assetTag: asset.assetTag || 'TAG',
+          assetCategory: asset.category,
+          assetImage: asset.imageUrl,
+          hourlyPenaltyRate: asset.hourlyPenaltyRate || 15.0,
+          assetLocation: asset.location,
+          userId: borrower._id ? borrower._id.toString() : r.userId,
+          userName: borrower.name || 'Unknown User',
+          userEmail: borrower.email || '',
+          userPhone: borrower.phone,
+          userDepartment: borrower.department,
+          startTime: r.startTime,
+          endTime: r.endTime,
+          status: r.status,
+          purpose: r.purpose,
+          checkedOutAt: r.checkedOutAt,
+          checkedOutByName: r.checkedOutBy?.name,
+          returnedAt: r.returnedAt,
+          receivedByName: r.receivedBy?.name,
+          checkoutChecklist: r.checkoutChecklist || {},
+          checkoutNotes: r.checkoutNotes,
+          returnInspection: r.returnInspection || {},
+          returnNotes: r.returnNotes,
+          overduePenaltyFee: r.overduePenaltyFee || 0,
+          damagePenaltyFee: r.damagePenaltyFee || 0,
+          penaltyStatus: r.penaltyStatus,
+          createdAt: r.createdAt,
+          currentOverdueHours: hoursOverdue,
+          estimatedOverdueFee: hoursOverdue * (asset.hourlyPenaltyRate || 15)
+        };
+      });
+
+      return res.json({ reservations: parsed });
+    }
+
+    const db = getDb();
     let query = `
       SELECT r.*,
              a.name as assetName, a.assetTag, a.category as assetCategory, a.imageUrl as assetImage, a.hourlyPenaltyRate, a.location as assetLocation,
@@ -31,7 +124,6 @@ function getAllReservations(req, res) {
     `;
     const params = [];
 
-    // If borrower, restrict to their own unless custodian/admin
     if (req.user.role === 'borrower') {
       query += ' AND r.userId = ?';
       params.push(req.user.id);
@@ -78,12 +170,75 @@ function getAllReservations(req, res) {
   }
 }
 
-function getReservationById(req, res) {
+async function getReservationById(req, res) {
   try {
-    const db = getDb();
-    syncOverdueReservations(db);
-
+    await syncOverdueReservations();
     const { id } = req.params;
+
+    if (isMongo()) {
+      const r = await Reservation.findById(id)
+        .populate('assetId')
+        .populate('userId')
+        .populate('checkedOutBy', 'name')
+        .populate('receivedBy', 'name');
+
+      if (!r) {
+        return res.status(404).json({ error: 'Reservation not found' });
+      }
+
+      const borrower = r.userId || {};
+      const asset = r.assetId || {};
+
+      if (req.user.role === 'borrower' && borrower._id?.toString() !== req.user.id) {
+        return res.status(403).json({ error: 'Access denied to this reservation' });
+      }
+
+      const now = new Date();
+      const end = new Date(r.endTime);
+      let hoursOverdue = 0;
+      if ((r.status === 'CHECKED_OUT' || r.status === 'OVERDUE') && now > end) {
+        hoursOverdue = Math.ceil((now - end) / (1000 * 60 * 60));
+      }
+
+      return res.json({
+        reservation: {
+          id: r._id.toString(),
+          _id: r._id.toString(),
+          assetId: asset._id?.toString(),
+          assetName: asset.name,
+          assetTag: asset.assetTag,
+          assetCategory: asset.category,
+          assetImage: asset.imageUrl,
+          hourlyPenaltyRate: asset.hourlyPenaltyRate || 15.0,
+          assetLocation: asset.location,
+          assetCondition: asset.conditionGrade,
+          userId: borrower._id?.toString(),
+          userName: borrower.name,
+          userEmail: borrower.email,
+          userPhone: borrower.phone,
+          userDepartment: borrower.department,
+          depositBalance: borrower.depositBalance,
+          startTime: r.startTime,
+          endTime: r.endTime,
+          status: r.status,
+          purpose: r.purpose,
+          checkedOutAt: r.checkedOutAt,
+          checkedOutByName: r.checkedOutBy?.name,
+          returnedAt: r.returnedAt,
+          receivedByName: r.receivedBy?.name,
+          checkoutChecklist: r.checkoutChecklist || {},
+          returnInspection: r.returnInspection || {},
+          overduePenaltyFee: r.overduePenaltyFee || 0,
+          damagePenaltyFee: r.damagePenaltyFee || 0,
+          penaltyStatus: r.penaltyStatus,
+          createdAt: r.createdAt,
+          currentOverdueHours: hoursOverdue,
+          estimatedOverdueFee: hoursOverdue * (asset.hourlyPenaltyRate || 15)
+        }
+      });
+    }
+
+    const db = getDb();
     const r = db.prepare(`
       SELECT r.*,
              a.name as assetName, a.assetTag, a.category as assetCategory, a.imageUrl as assetImage, a.hourlyPenaltyRate, a.location as assetLocation, a.conditionGrade as assetCondition,
@@ -102,7 +257,6 @@ function getReservationById(req, res) {
       return res.status(404).json({ error: 'Reservation not found' });
     }
 
-    // Role check: borrowers can only view their own
     if (req.user.role === 'borrower' && r.userId !== req.user.id) {
       return res.status(403).json({ error: 'Access denied to this reservation' });
     }
@@ -129,9 +283,7 @@ function getReservationById(req, res) {
   }
 }
 
-function createReservation(req, res) {
-  const db = getDb();
-
+async function createReservation(req, res) {
   try {
     const { assetId, startTime, endTime, purpose } = req.body;
     const targetUserId = (req.user.role !== 'borrower' && req.body.userId) ? req.body.userId : req.user.id;
@@ -148,7 +300,7 @@ function createReservation(req, res) {
       return res.status(400).json({ error: 'Invalid datetime format for startTime or endTime' });
     }
 
-    if (start < new Date(now.getTime() - 15 * 60 * 1000)) { // allow 15m leeway for client clock skew
+    if (start < new Date(now.getTime() - 15 * 60 * 1000)) {
       return res.status(400).json({ error: 'Cannot book reservations in the past' });
     }
 
@@ -157,11 +309,78 @@ function createReservation(req, res) {
     }
 
     const durationHours = (end - start) / (1000 * 60 * 60);
-    if (durationHours > 168) { // 7 days max
+    if (durationHours > 168) {
       return res.status(400).json({ error: 'Reservation duration cannot exceed 7 days (168 hours)' });
     }
 
-    // Check borrower profile for unpaid penalties
+    if (isMongo()) {
+      const borrower = await User.findById(targetUserId);
+      if (!borrower) {
+        return res.status(404).json({ error: 'Target borrower not found' });
+      }
+
+      const unpaidPenalties = await Reservation.countDocuments({
+        userId: targetUserId,
+        penaltyStatus: 'ASSESSED'
+      });
+
+      if (unpaidPenalties > 0) {
+        return res.status(403).json({
+          error: `Borrower has ${unpaidPenalties} outstanding unpaid penalty fees. Please settle penalties before new bookings.`
+        });
+      }
+
+      const asset = await Asset.findById(assetId);
+      if (!asset) {
+        return res.status(404).json({ error: 'Asset does not exist' });
+      }
+
+      if (asset.status === 'MAINTENANCE' || asset.status === 'DECOMMISSIONED') {
+        return res.status(400).json({ error: `Asset is currently in ${asset.status} state and cannot be reserved` });
+      }
+
+      // Check slot conflicts
+      const conflicts = await Reservation.find({
+        assetId,
+        status: { $in: ['CONFIRMED', 'CHECKED_OUT', 'OVERDUE'] },
+        $or: [
+          { startTime: { $lte: start }, endTime: { $gt: start } },
+          { startTime: { $lt: end }, endTime: { $gte: end } },
+          { startTime: { $gte: start }, endTime: { $lte: end } }
+        ]
+      });
+
+      if (conflicts.length > 0) {
+        return res.status(400).json({ error: 'Slot conflict: Asset is already booked during this time interval' });
+      }
+
+      const reservation = await Reservation.create({
+        assetId,
+        userId: targetUserId,
+        startTime: start,
+        endTime: end,
+        status: 'CONFIRMED',
+        purpose: purpose || 'Academic Project'
+      });
+
+      await AuditLog.create({
+        actorId: req.user.id,
+        actorName: req.user.name,
+        action: 'RESERVATION_CREATED',
+        targetType: 'RESERVATION',
+        targetId: reservation._id.toString(),
+        details: `Booked ${asset.name} from ${start.toLocaleString()} to ${end.toLocaleString()}`
+      });
+
+      return res.status(201).json({
+        message: 'Reservation confirmed successfully (MongoDB)',
+        reservationId: reservation._id.toString(),
+        assetName: asset.name
+      });
+    }
+
+    // SQLite Flow
+    const db = getDb();
     const borrower = db.prepare('SELECT id, name, depositBalance FROM users WHERE id = ?').get(targetUserId);
     if (!borrower) {
       return res.status(404).json({ error: 'Target borrower not found' });
@@ -178,9 +397,7 @@ function createReservation(req, res) {
       });
     }
 
-    // Concurrency Check inside transactional block
     const createTx = db.transaction(() => {
-      // 1. Check asset status
       const asset = db.prepare('SELECT id, name, status, conditionGrade FROM assets WHERE id = ?').get(assetId);
       if (!asset) {
         throw new Error('Asset does not exist');
@@ -190,7 +407,6 @@ function createReservation(req, res) {
         throw new Error(`Asset is currently in ${asset.status} state and cannot be reserved`);
       }
 
-      // 2. Conflict overlap check
       const startIso = start.toISOString();
       const endIso = end.toISOString();
       const conflicts = db.prepare(`
@@ -209,7 +425,6 @@ function createReservation(req, res) {
         throw new Error('Slot conflict: Asset is already booked during this time interval');
       }
 
-      // 3. Insert reservation
       const insertResult = db.prepare(`
         INSERT INTO reservations (assetId, userId, startTime, endTime, status, purpose)
         VALUES (?, ?, ?, ?, 'CONFIRMED', ?)
@@ -217,7 +432,6 @@ function createReservation(req, res) {
 
       const reservationId = insertResult.lastInsertRowid;
 
-      // 4. Audit log
       db.prepare(`
         INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
         VALUES (?, ?, 'RESERVATION_CREATED', 'RESERVATION', ?, ?)
@@ -243,11 +457,40 @@ function createReservation(req, res) {
   }
 }
 
-function cancelReservation(req, res) {
+async function cancelReservation(req, res) {
   try {
-    const db = getDb();
     const { id } = req.params;
 
+    if (isMongo()) {
+      const reservation = await Reservation.findById(id);
+      if (!reservation) {
+        return res.status(404).json({ error: 'Reservation not found' });
+      }
+
+      if (req.user.role === 'borrower' && reservation.userId.toString() !== req.user.id) {
+        return res.status(403).json({ error: 'Unauthorized to cancel this reservation' });
+      }
+
+      if (reservation.status !== 'CONFIRMED' && reservation.status !== 'PENDING') {
+        return res.status(400).json({ error: `Cannot cancel a reservation in ${reservation.status} status` });
+      }
+
+      reservation.status = 'CANCELLED';
+      await reservation.save();
+
+      await AuditLog.create({
+        actorId: req.user.id,
+        actorName: req.user.name,
+        action: 'RESERVATION_CANCELLED',
+        targetType: 'RESERVATION',
+        targetId: id,
+        details: 'Reservation cancelled by user/custodian'
+      });
+
+      return res.json({ message: 'Reservation cancelled successfully' });
+    }
+
+    const db = getDb();
     const reservation = db.prepare('SELECT * FROM reservations WHERE id = ?').get(id);
     if (!reservation) {
       return res.status(404).json({ error: 'Reservation not found' });
@@ -263,7 +506,6 @@ function cancelReservation(req, res) {
 
     db.prepare("UPDATE reservations SET status = 'CANCELLED' WHERE id = ?").run(id);
 
-    // Audit log
     db.prepare(`
       INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
       VALUES (?, ?, 'RESERVATION_CANCELLED', 'RESERVATION', ?, 'Reservation cancelled by user/custodian')
@@ -276,36 +518,63 @@ function cancelReservation(req, res) {
   }
 }
 
-// Handover Check-out Workflow
-function checkoutReservation(req, res) {
-  const db = getDb();
-
+async function checkoutReservation(req, res) {
   try {
     const { id } = req.params;
     const { checklist = {}, notes = '' } = req.body;
 
-    const checkoutTx = db.transaction(() => {
-      const reservation = db.prepare('SELECT * FROM reservations WHERE id = ?').get(id);
-      if (!reservation) {
-        throw new Error('Reservation not found');
-      }
+    if (isMongo()) {
+      const reservation = await Reservation.findById(id);
+      if (!reservation) return res.status(404).json({ error: 'Reservation not found' });
 
       if (reservation.status !== 'CONFIRMED') {
-        throw new Error(`Cannot checkout reservation with status '${reservation.status}'. Must be 'CONFIRMED'.`);
+        return res.status(400).json({ error: `Cannot checkout reservation with status '${reservation.status}'. Must be 'CONFIRMED'.` });
       }
 
-      const asset = db.prepare('SELECT * FROM assets WHERE id = ?').get(reservation.assetId);
-      if (!asset) {
-        throw new Error('Associated asset not found');
-      }
+      const asset = await Asset.findById(reservation.assetId);
+      if (!asset) return res.status(404).json({ error: 'Associated asset not found' });
 
       if (asset.status !== 'AVAILABLE' && asset.status !== 'RESERVED') {
-        throw new Error(`Asset cannot be checked out because its status is ${asset.status}`);
+        return res.status(400).json({ error: `Asset cannot be checked out because its status is ${asset.status}` });
       }
 
-      const now = new Date().toISOString();
+      reservation.status = 'CHECKED_OUT';
+      reservation.checkedOutAt = new Date();
+      reservation.checkedOutBy = req.user.id;
+      reservation.checkoutChecklist = checklist;
+      reservation.checkoutNotes = notes;
+      await reservation.save();
 
-      // Update reservation to CHECKED_OUT
+      asset.status = 'IN_USE';
+      await asset.save();
+
+      await AuditLog.create({
+        actorId: req.user.id,
+        actorName: req.user.name,
+        action: 'CUSTODY_HANDOVER',
+        targetType: 'RESERVATION',
+        targetId: id,
+        details: `Custody handed over for asset ${asset.assetTag} (${asset.name}). Checklist completed.`
+      });
+
+      return res.json({
+        message: 'Asset checked out successfully. Custody is now active.',
+        assetTag: asset.assetTag,
+        assetName: asset.name
+      });
+    }
+
+    const db = getDb();
+    const checkoutTx = db.transaction(() => {
+      const reservation = db.prepare('SELECT * FROM reservations WHERE id = ?').get(id);
+      if (!reservation) throw new Error('Reservation not found');
+      if (reservation.status !== 'CONFIRMED') throw new Error(`Cannot checkout reservation with status '${reservation.status}'. Must be 'CONFIRMED'.`);
+
+      const asset = db.prepare('SELECT * FROM assets WHERE id = ?').get(reservation.assetId);
+      if (!asset) throw new Error('Associated asset not found');
+      if (asset.status !== 'AVAILABLE' && asset.status !== 'RESERVED') throw new Error(`Asset cannot be checked out because its status is ${asset.status}`);
+
+      const now = new Date().toISOString();
       db.prepare(`
         UPDATE reservations
         SET status = 'CHECKED_OUT',
@@ -316,10 +585,8 @@ function checkoutReservation(req, res) {
         WHERE id = ?
       `).run(now, req.user.id, JSON.stringify(checklist), notes, id);
 
-      // Update asset to IN_USE
       db.prepare("UPDATE assets SET status = 'IN_USE' WHERE id = ?").run(reservation.assetId);
 
-      // Audit log
       db.prepare(`
         INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
         VALUES (?, ?, 'CUSTODY_HANDOVER', 'RESERVATION', ?, ?)
@@ -345,10 +612,7 @@ function checkoutReservation(req, res) {
   }
 }
 
-// Inspection Check-in / Return Workflow & Penalty Engine
-function returnReservation(req, res) {
-  const db = getDb();
-
+async function returnReservation(req, res) {
   try {
     const { id } = req.params;
     const {
@@ -360,12 +624,103 @@ function returnReservation(req, res) {
       severity = 'MEDIUM'
     } = req.body;
 
-    const returnTx = db.transaction(() => {
-      const reservation = db.prepare('SELECT * FROM reservations WHERE id = ?').get(id);
-      if (!reservation) {
-        throw new Error('Reservation not found');
+    if (isMongo()) {
+      const reservation = await Reservation.findById(id);
+      if (!reservation) return res.status(404).json({ error: 'Reservation not found' });
+      if (reservation.status !== 'CHECKED_OUT' && reservation.status !== 'OVERDUE') {
+        return res.status(400).json({ error: `Cannot return reservation with status '${reservation.status}'. Must be 'CHECKED_OUT' or 'OVERDUE'.` });
       }
 
+      const asset = await Asset.findById(reservation.assetId);
+      const borrower = await User.findById(reservation.userId);
+
+      const now = new Date();
+      const endTime = new Date(reservation.endTime);
+      let overdueHours = 0;
+      let overdueFee = 0.0;
+
+      if (now > endTime) {
+        overdueHours = Math.ceil((now - endTime) / (1000 * 60 * 60));
+        overdueFee = overdueHours * (asset.hourlyPenaltyRate || 15.0);
+      }
+
+      const parsedDamageFee = hasDamage ? Math.max(0, parseFloat(damageFee) || 0) : 0.0;
+      const totalFee = overdueFee + parsedDamageFee;
+      let penaltyStatus = totalFee > 0 ? 'ASSESSED' : 'NONE';
+
+      let newReservationStatus = hasDamage ? 'FLAGGED_DAMAGE' : 'RETURNED';
+      let newAssetStatus = hasDamage ? 'MAINTENANCE' : 'AVAILABLE';
+      let newConditionGrade = hasDamage ? 'DAMAGED' : (inspection.newConditionGrade || asset.conditionGrade);
+
+      let deduction = 0;
+      if (totalFee > 0 && borrower.depositBalance >= totalFee) {
+        deduction = totalFee;
+        penaltyStatus = 'PAID';
+        borrower.depositBalance -= deduction;
+        await borrower.save();
+      }
+
+      reservation.status = newReservationStatus;
+      reservation.returnedAt = now;
+      reservation.receivedBy = req.user.id;
+      reservation.returnInspection = inspection;
+      reservation.returnNotes = notes;
+      reservation.overduePenaltyFee = overdueFee;
+      reservation.damagePenaltyFee = parsedDamageFee;
+      reservation.penaltyStatus = penaltyStatus;
+      await reservation.save();
+
+      asset.status = newAssetStatus;
+      asset.conditionGrade = newConditionGrade;
+      await asset.save();
+
+      let maintenanceTicketId = null;
+      if (hasDamage) {
+        const ticket = await MaintenanceTicket.create({
+          assetId: asset._id,
+          reportedBy: req.user.id,
+          reservationId: reservation._id,
+          issueDescription: damageDescription || 'Damage detected during custodian return inspection',
+          severity: severity || 'MEDIUM',
+          status: 'OPEN',
+          estimatedRepairCost: parsedDamageFee,
+          resolutionNotes: `Reported on return inspection by custodian ${req.user.name}`
+        });
+        maintenanceTicketId = ticket._id.toString();
+      }
+
+      await AuditLog.create({
+        actorId: req.user.id,
+        actorName: req.user.name,
+        action: hasDamage ? 'RETURN_WITH_DAMAGE' : 'RETURN_CLEAN',
+        targetType: 'RESERVATION',
+        targetId: id,
+        details: `Return inspected for ${asset.assetTag}. Overdue Fee: $${overdueFee}, Damage Fee: $${parsedDamageFee}. Status: ${newReservationStatus}`
+      });
+
+      return res.json({
+        message: hasDamage
+          ? 'Asset returned with damage flagged. Asset moved to MAINTENANCE quarantine.'
+          : 'Asset returned in good condition and restocked to AVAILABLE.',
+        result: {
+          reservationId: id,
+          hasDamage,
+          overdueHours,
+          overdueFee,
+          damageFee: parsedDamageFee,
+          totalPenalty: totalFee,
+          deductedFromBalance: deduction,
+          penaltyStatus,
+          assetStatus: newAssetStatus,
+          maintenanceTicketId
+        }
+      });
+    }
+
+    const db = getDb();
+    const returnTx = db.transaction(() => {
+      const reservation = db.prepare('SELECT * FROM reservations WHERE id = ?').get(id);
+      if (!reservation) throw new Error('Reservation not found');
       if (reservation.status !== 'CHECKED_OUT' && reservation.status !== 'OVERDUE') {
         throw new Error(`Cannot return reservation with status '${reservation.status}'. Must be 'CHECKED_OUT' or 'OVERDUE'.`);
       }
@@ -391,7 +746,6 @@ function returnReservation(req, res) {
       let newAssetStatus = hasDamage ? 'MAINTENANCE' : 'AVAILABLE';
       let newConditionGrade = hasDamage ? 'DAMAGED' : (inspection.newConditionGrade || asset.conditionGrade);
 
-      // Deduct from deposit balance if available
       let deduction = 0;
       if (totalFee > 0 && borrower.depositBalance >= totalFee) {
         deduction = totalFee;
@@ -399,7 +753,7 @@ function returnReservation(req, res) {
         db.prepare('UPDATE users SET depositBalance = depositBalance - ? WHERE id = ?').run(deduction, borrower.id);
       }
 
-      // Update reservation
+      const nowIso = now.toISOString();
       db.prepare(`
         UPDATE reservations
         SET status = ?,
@@ -413,7 +767,7 @@ function returnReservation(req, res) {
         WHERE id = ?
       `).run(
         newReservationStatus,
-        now.toISOString(),
+        nowIso,
         req.user.id,
         JSON.stringify(inspection),
         notes,
@@ -423,104 +777,104 @@ function returnReservation(req, res) {
         id
       );
 
-      // Update asset status
       db.prepare(`
         UPDATE assets
-        SET status = ?, conditionGrade = ?
+        SET status = ?,
+            conditionGrade = ?
         WHERE id = ?
       `).run(newAssetStatus, newConditionGrade, asset.id);
 
-      // If damaged, automatically create maintenance quarantine ticket
       let maintenanceTicketId = null;
       if (hasDamage) {
         const ticketResult = db.prepare(`
-          INSERT INTO maintenance_tickets (assetId, reportedBy, reservationId, issueDescription, severity, status, estimatedRepairCost)
-          VALUES (?, ?, ?, ?, ?, 'OPEN', ?)
+          INSERT INTO maintenance_tickets (assetId, reportedBy, reservationId, issueDescription, severity, status, estimatedRepairCost, resolutionNotes)
+          VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?)
         `).run(
           asset.id,
           req.user.id,
           id,
-          damageDescription || notes || 'Damaged upon return inspection',
-          severity,
-          parsedDamageFee
+          damageDescription || 'Damage detected during custodian return inspection',
+          severity || 'MEDIUM',
+          parsedDamageFee,
+          `Reported on return inspection by custodian ${req.user.name}`
         );
         maintenanceTicketId = ticketResult.lastInsertRowid;
-
-        // Audit log for maintenance quarantine
-        db.prepare(`
-          INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
-          VALUES (?, ?, 'MAINTENANCE_QUARANTINED', 'ASSET', ?, ?)
-        `).run(
-          req.user.id,
-          req.user.name,
-          asset.id,
-          `Asset ${asset.assetTag} quarantined into maintenance ticket #${maintenanceTicketId} due to return damage.`
-        );
       }
 
-      // Audit log for return
       db.prepare(`
         INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
-        VALUES (?, ?, 'RETURN_INSPECTED', 'RESERVATION', ?, ?)
+        VALUES (?, ?, ?, 'RESERVATION', ?, ?)
       `).run(
         req.user.id,
         req.user.name,
+        hasDamage ? 'RETURN_WITH_DAMAGE' : 'RETURN_CLEAN',
         id,
-        `Inspected return of ${asset.assetTag}. Overdue fee: $${overdueFee}, Damage fee: $${parsedDamageFee}. Status: ${newReservationStatus}.`
+        `Return inspected for ${asset.assetTag}. Overdue Fee: $${overdueFee}, Damage Fee: $${parsedDamageFee}. Status: ${newReservationStatus}`
       );
 
       return {
+        reservationId: id,
+        hasDamage,
         overdueHours,
         overdueFee,
         damageFee: parsedDamageFee,
-        totalFee,
+        totalPenalty: totalFee,
+        deductedFromBalance: deduction,
         penaltyStatus,
-        hasDamage,
+        assetStatus: newAssetStatus,
         maintenanceTicketId
       };
     });
 
     const result = returnTx();
     return res.json({
-      message: result.hasDamage ? 'Gear returned with damage. Asset placed in Maintenance Quarantine.' : 'Gear returned and verified clean.',
+      message: hasDamage
+        ? 'Asset returned with damage flagged. Asset moved to MAINTENANCE quarantine.'
+        : 'Asset returned in good condition and restocked to AVAILABLE.',
       result
     });
   } catch (error) {
     console.error('Return error:', error.message);
-    return res.status(400).json({ error: error.message || 'Failed to process gear return' });
+    return res.status(400).json({ error: error.message || 'Failed to process asset return' });
   }
 }
 
-// Settle / Waive penalty
-function settlePenalty(req, res) {
+async function settlePenalty(req, res) {
   try {
-    const db = getDb();
     const { id } = req.params;
-    const { action } = req.body; // 'PAY' or 'WAIVE'
 
+    if (isMongo()) {
+      const reservation = await Reservation.findById(id);
+      if (!reservation) return res.status(404).json({ error: 'Reservation not found' });
+      reservation.penaltyStatus = 'PAID';
+      await reservation.save();
+
+      await AuditLog.create({
+        actorId: req.user.id,
+        actorName: req.user.name,
+        action: 'PENALTY_SETTLED',
+        targetType: 'RESERVATION',
+        targetId: id,
+        details: 'Outstanding penalty fee was marked settled/paid.'
+      });
+
+      return res.json({ message: 'Penalty settled successfully' });
+    }
+
+    const db = getDb();
     const reservation = db.prepare('SELECT * FROM reservations WHERE id = ?').get(id);
     if (!reservation) {
       return res.status(404).json({ error: 'Reservation not found' });
     }
 
-    if (reservation.penaltyStatus !== 'ASSESSED') {
-      return res.status(400).json({ error: `Penalty status is already ${reservation.penaltyStatus}` });
-    }
-
-    const nextStatus = action === 'WAIVE' ? 'WAIVED' : 'PAID';
-    db.prepare('UPDATE reservations SET penaltyStatus = ? WHERE id = ?').run(nextStatus, id);
+    db.prepare("UPDATE reservations SET penaltyStatus = 'PAID' WHERE id = ?").run(id);
 
     db.prepare(`
       INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
-      VALUES (?, ?, 'PENALTY_SETTLED', 'RESERVATION', ?, ?)
-    `).run(
-      req.user.id,
-      req.user.name,
-      id,
-      `Penalty for reservation #${id} marked as ${nextStatus}`
-    );
+      VALUES (?, ?, 'PENALTY_SETTLED', 'RESERVATION', ?, 'Outstanding penalty fee was marked settled/paid.')
+    `).run(req.user.id, req.user.name, id);
 
-    return res.json({ message: `Penalty successfully marked as ${nextStatus}` });
+    return res.json({ message: 'Penalty settled successfully' });
   } catch (error) {
     console.error('Settle penalty error:', error);
     return res.status(500).json({ error: 'Failed to settle penalty' });

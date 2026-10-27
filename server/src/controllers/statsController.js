@@ -1,7 +1,86 @@
 const { getDb } = require('../db/connection');
+const mongoose = require('mongoose');
+const Asset = require('../models/Asset');
+const Reservation = require('../models/Reservation');
+const MaintenanceTicket = require('../models/MaintenanceTicket');
+const AuditLog = require('../models/AuditLog');
 
-function getDashboardStats(req, res) {
+function isMongo() {
+  return mongoose.connection && mongoose.connection.readyState === 1;
+}
+
+async function getDashboardStats(req, res) {
   try {
+    if (isMongo()) {
+      const [
+        totalAssets,
+        availableAssets,
+        inUseAssets,
+        maintenanceAssets,
+        activeLoans,
+        overdueLoans,
+        pendingPickups,
+        openTickets,
+        distinctCategories
+      ] = await Promise.all([
+        Asset.countDocuments(),
+        Asset.countDocuments({ status: 'AVAILABLE' }),
+        Asset.countDocuments({ status: 'IN_USE' }),
+        Asset.countDocuments({ status: 'MAINTENANCE' }),
+        Reservation.countDocuments({ status: 'CHECKED_OUT' }),
+        Reservation.countDocuments({ status: 'OVERDUE' }),
+        Reservation.countDocuments({ status: 'CONFIRMED' }),
+        MaintenanceTicket.countDocuments({ status: { $in: ['OPEN', 'IN_PROGRESS'] } }),
+        Asset.distinct('category')
+      ]);
+
+      const categoryBreakdown = await Promise.all(
+        distinctCategories.map(async cat => ({
+          category: cat,
+          count: await Asset.countDocuments({ category: cat })
+        }))
+      );
+
+      const allReservations = await Reservation.find();
+      let totalOverdue = 0;
+      let totalDamage = 0;
+      let totalCollected = 0;
+      let totalPending = 0;
+
+      for (const r of allReservations) {
+        const overdue = r.overduePenaltyFee || 0;
+        const damage = r.damagePenaltyFee || 0;
+        const total = overdue + damage;
+        totalOverdue += overdue;
+        totalDamage += damage;
+        if (r.penaltyStatus === 'PAID') {
+          totalCollected += total;
+        } else if (r.penaltyStatus === 'ASSESSED') {
+          totalPending += total;
+        }
+      }
+
+      return res.json({
+        stats: {
+          totalAssets,
+          availableAssets,
+          inUseAssets,
+          maintenanceAssets,
+          activeLoans,
+          overdueLoans,
+          pendingPickups,
+          openTickets,
+          financials: {
+            totalOverdue,
+            totalDamage,
+            totalCollected,
+            totalPending
+          },
+          categoryBreakdown
+        }
+      });
+    }
+
     const db = getDb();
 
     // 1. Asset metrics
@@ -60,16 +139,34 @@ function getDashboardStats(req, res) {
   }
 }
 
-function getAuditLogs(req, res) {
+async function getAuditLogs(req, res) {
   try {
-    const db = getDb();
     const { limit = 50 } = req.query;
+    const limitNum = Math.min(parseInt(limit, 10) || 50, 100);
 
+    if (isMongo()) {
+      const logs = await AuditLog.find().sort({ createdAt: -1 }).limit(limitNum);
+      return res.json({
+        logs: logs.map(l => ({
+          id: l._id.toString(),
+          _id: l._id.toString(),
+          actorId: l.actorId?.toString(),
+          actorName: l.actorName,
+          action: l.action,
+          targetType: l.targetType,
+          targetId: l.targetId,
+          details: l.details,
+          createdAt: l.createdAt
+        }))
+      });
+    }
+
+    const db = getDb();
     const logs = db.prepare(`
       SELECT * FROM audit_logs
       ORDER BY createdAt DESC
       LIMIT ?
-    `).all(Math.min(parseInt(limit, 10) || 50, 100));
+    `).all(limitNum);
 
     return res.json({ logs });
   } catch (error) {
