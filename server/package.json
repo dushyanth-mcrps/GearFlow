@@ -1,21 +1,23 @@
 {
-  "name": "server",
+  "name": "gearflow-server",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "GearFlow API - Equipment & Asset Lending Platform with Custody Lifecycle and Penalty Engine",
+  "main": "src/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node src/index.js",
+    "dev": "node src/index.js",
+    "seed": "node src/db/seed.js",
+    "test": "node test/api.test.js"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": ["asset-management", "lending", "equipment-custody", "penalty-engine"],
+  "author": "Shyam Srivardhan",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "bcryptjs": "^3.0.3",
-    "better-sqlite3": "^13.0.3",
-    "cors": "^2.8.6",
-    "dotenv": "^18.0.9",
-    "express": "^5.3.0",
+    "better-sqlite3": "^12.6.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3"
   }
 }
