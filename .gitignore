@@ -19,10 +19,12 @@ build/
 .env.*.local
 
 # Database storage
-server/gearflow.sqlite
-server/gearflow.sqlite-journal
-server/gearflow.sqlite-shm
-server/gearflow.sqlite-wal
+server/gearflow.sqlite*
+server/test/test_gearflow.sqlite*
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
 
 # OS specific
 .DS_Store
