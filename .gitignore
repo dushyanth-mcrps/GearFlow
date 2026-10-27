@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Testing & logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.system_generated/
+
+# Production builds
+dist/
+build/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Database storage
+server/gearflow.sqlite
+server/gearflow.sqlite-journal
+server/gearflow.sqlite-shm
+server/gearflow.sqlite-wal
+
+# OS specific
+.DS_Store
+Thumbs.db
