@@ -10,6 +10,20 @@ function isMongo() {
   return mongoose.connection && mongoose.connection.readyState === 1;
 }
 
+function resolveSqliteUserId(db, reqUser) {
+  if (!reqUser) return 1;
+  if (reqUser.id && !isNaN(Number(reqUser.id))) {
+    const row = db.prepare('SELECT id FROM users WHERE id = ?').get(Number(reqUser.id));
+    if (row) return row.id;
+  }
+  if (reqUser.email) {
+    const byEmail = db.prepare('SELECT id FROM users WHERE email = ?').get(reqUser.email.toLowerCase().trim());
+    if (byEmail) return byEmail.id;
+  }
+  const fallback = db.prepare("SELECT id FROM users WHERE role IN ('custodian', 'admin') LIMIT 1").get();
+  return fallback ? fallback.id : 1;
+}
+
 // Automatically checks and marks overdue checkouts
 async function syncOverdueReservations() {
   if (isMongo()) {
@@ -125,8 +139,9 @@ async function getAllReservations(req, res) {
     const params = [];
 
     if (req.user.role === 'borrower') {
+      const sqliteBorrowerId = resolveSqliteUserId(db, req.user);
       query += ' AND r.userId = ?';
-      params.push(req.user.id);
+      params.push(sqliteBorrowerId);
     } else if (userId) {
       query += ' AND r.userId = ?';
       params.push(userId);
@@ -175,67 +190,65 @@ async function getReservationById(req, res) {
     await syncOverdueReservations();
     const { id } = req.params;
 
-    if (isMongo()) {
+    if (isMongo() && mongoose.Types.ObjectId.isValid(id)) {
       const r = await Reservation.findById(id)
         .populate('assetId')
         .populate('userId')
         .populate('checkedOutBy', 'name')
         .populate('receivedBy', 'name');
 
-      if (!r) {
-        return res.status(404).json({ error: 'Reservation not found' });
-      }
+      if (r) {
+        const borrower = r.userId || {};
+        const asset = r.assetId || {};
 
-      const borrower = r.userId || {};
-      const asset = r.assetId || {};
-
-      if (req.user.role === 'borrower' && borrower._id?.toString() !== req.user.id) {
-        return res.status(403).json({ error: 'Access denied to this reservation' });
-      }
-
-      const now = new Date();
-      const end = new Date(r.endTime);
-      let hoursOverdue = 0;
-      if ((r.status === 'CHECKED_OUT' || r.status === 'OVERDUE') && now > end) {
-        hoursOverdue = Math.ceil((now - end) / (1000 * 60 * 60));
-      }
-
-      return res.json({
-        reservation: {
-          id: r._id.toString(),
-          _id: r._id.toString(),
-          assetId: asset._id?.toString(),
-          assetName: asset.name,
-          assetTag: asset.assetTag,
-          assetCategory: asset.category,
-          assetImage: asset.imageUrl,
-          hourlyPenaltyRate: asset.hourlyPenaltyRate || 15.0,
-          assetLocation: asset.location,
-          assetCondition: asset.conditionGrade,
-          userId: borrower._id?.toString(),
-          userName: borrower.name,
-          userEmail: borrower.email,
-          userPhone: borrower.phone,
-          userDepartment: borrower.department,
-          depositBalance: borrower.depositBalance,
-          startTime: r.startTime,
-          endTime: r.endTime,
-          status: r.status,
-          purpose: r.purpose,
-          checkedOutAt: r.checkedOutAt,
-          checkedOutByName: r.checkedOutBy?.name,
-          returnedAt: r.returnedAt,
-          receivedByName: r.receivedBy?.name,
-          checkoutChecklist: r.checkoutChecklist || {},
-          returnInspection: r.returnInspection || {},
-          overduePenaltyFee: r.overduePenaltyFee || 0,
-          damagePenaltyFee: r.damagePenaltyFee || 0,
-          penaltyStatus: r.penaltyStatus,
-          createdAt: r.createdAt,
-          currentOverdueHours: hoursOverdue,
-          estimatedOverdueFee: hoursOverdue * (asset.hourlyPenaltyRate || 15)
+        if (req.user.role === 'borrower' && borrower._id?.toString() !== req.user.id) {
+          return res.status(403).json({ error: 'Access denied to this reservation' });
         }
-      });
+
+        const now = new Date();
+        const end = new Date(r.endTime);
+        let hoursOverdue = 0;
+        if ((r.status === 'CHECKED_OUT' || r.status === 'OVERDUE') && now > end) {
+          hoursOverdue = Math.ceil((now - end) / (1000 * 60 * 60));
+        }
+
+        return res.json({
+          reservation: {
+            id: r._id.toString(),
+            _id: r._id.toString(),
+            assetId: asset._id?.toString(),
+            assetName: asset.name,
+            assetTag: asset.assetTag,
+            assetCategory: asset.category,
+            assetImage: asset.imageUrl,
+            hourlyPenaltyRate: asset.hourlyPenaltyRate || 15.0,
+            assetLocation: asset.location,
+            assetCondition: asset.conditionGrade,
+            userId: borrower._id?.toString(),
+            userName: borrower.name,
+            userEmail: borrower.email,
+            userPhone: borrower.phone,
+            userDepartment: borrower.department,
+            depositBalance: borrower.depositBalance,
+            startTime: r.startTime,
+            endTime: r.endTime,
+            status: r.status,
+            purpose: r.purpose,
+            checkedOutAt: r.checkedOutAt,
+            checkedOutByName: r.checkedOutBy?.name,
+            returnedAt: r.returnedAt,
+            receivedByName: r.receivedBy?.name,
+            checkoutChecklist: r.checkoutChecklist || {},
+            returnInspection: r.returnInspection || {},
+            overduePenaltyFee: r.overduePenaltyFee || 0,
+            damagePenaltyFee: r.damagePenaltyFee || 0,
+            penaltyStatus: r.penaltyStatus,
+            createdAt: r.createdAt,
+            currentOverdueHours: hoursOverdue,
+            estimatedOverdueFee: hoursOverdue * (asset.hourlyPenaltyRate || 15)
+          }
+        });
+      }
     }
 
     const db = getDb();
@@ -257,7 +270,8 @@ async function getReservationById(req, res) {
       return res.status(404).json({ error: 'Reservation not found' });
     }
 
-    if (req.user.role === 'borrower' && r.userId !== req.user.id) {
+    const sqliteBorrowerId = resolveSqliteUserId(db, req.user);
+    if (req.user.role === 'borrower' && r.userId !== sqliteBorrowerId) {
       return res.status(403).json({ error: 'Access denied to this reservation' });
     }
 
@@ -286,7 +300,6 @@ async function getReservationById(req, res) {
 async function createReservation(req, res) {
   try {
     const { assetId, startTime, endTime, purpose } = req.body;
-    const targetUserId = (req.user.role !== 'borrower' && req.body.userId) ? req.body.userId : req.user.id;
 
     if (!assetId || !startTime || !endTime) {
       return res.status(400).json({ error: 'assetId, startTime, and endTime are required' });
@@ -313,7 +326,8 @@ async function createReservation(req, res) {
       return res.status(400).json({ error: 'Reservation duration cannot exceed 7 days (168 hours)' });
     }
 
-    if (isMongo()) {
+    if (isMongo() && mongoose.Types.ObjectId.isValid(assetId)) {
+      const targetUserId = (req.user.role !== 'borrower' && req.body.userId) ? req.body.userId : req.user.id;
       const borrower = await User.findById(targetUserId);
       if (!borrower) {
         return res.status(404).json({ error: 'Target borrower not found' });
@@ -339,7 +353,6 @@ async function createReservation(req, res) {
         return res.status(400).json({ error: `Asset is currently in ${asset.status} state and cannot be reserved` });
       }
 
-      // Check slot conflicts
       const conflicts = await Reservation.find({
         assetId,
         status: { $in: ['CONFIRMED', 'CHECKED_OUT', 'OVERDUE'] },
@@ -373,7 +386,7 @@ async function createReservation(req, res) {
       });
 
       return res.status(201).json({
-        message: 'Reservation confirmed successfully (MongoDB)',
+        message: 'Reservation confirmed successfully',
         reservationId: reservation._id.toString(),
         assetName: asset.name
       });
@@ -381,6 +394,11 @@ async function createReservation(req, res) {
 
     // SQLite Flow
     const db = getDb();
+    const actorId = resolveSqliteUserId(db, req.user);
+    const targetUserId = req.user.role !== 'borrower' && req.body.userId && !isNaN(Number(req.body.userId))
+      ? Number(req.body.userId)
+      : actorId;
+
     const borrower = db.prepare('SELECT id, name, depositBalance FROM users WHERE id = ?').get(targetUserId);
     if (!borrower) {
       return res.status(404).json({ error: 'Target borrower not found' });
@@ -436,7 +454,7 @@ async function createReservation(req, res) {
         INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
         VALUES (?, ?, 'RESERVATION_CREATED', 'RESERVATION', ?, ?)
       `).run(
-        req.user.id,
+        actorId,
         req.user.name,
         reservationId,
         `Booked ${asset.name} from ${start.toLocaleString()} to ${end.toLocaleString()}`
@@ -461,33 +479,31 @@ async function cancelReservation(req, res) {
   try {
     const { id } = req.params;
 
-    if (isMongo()) {
+    if (isMongo() && mongoose.Types.ObjectId.isValid(id)) {
       const reservation = await Reservation.findById(id);
-      if (!reservation) {
-        return res.status(404).json({ error: 'Reservation not found' });
+      if (reservation) {
+        if (req.user.role === 'borrower' && reservation.userId.toString() !== req.user.id) {
+          return res.status(403).json({ error: 'Unauthorized to cancel this reservation' });
+        }
+
+        if (reservation.status !== 'CONFIRMED' && reservation.status !== 'PENDING') {
+          return res.status(400).json({ error: `Cannot cancel a reservation in ${reservation.status} status` });
+        }
+
+        reservation.status = 'CANCELLED';
+        await reservation.save();
+
+        await AuditLog.create({
+          actorId: req.user.id,
+          actorName: req.user.name,
+          action: 'RESERVATION_CANCELLED',
+          targetType: 'RESERVATION',
+          targetId: id,
+          details: 'Reservation cancelled by user/custodian'
+        });
+
+        return res.json({ message: 'Reservation cancelled successfully' });
       }
-
-      if (req.user.role === 'borrower' && reservation.userId.toString() !== req.user.id) {
-        return res.status(403).json({ error: 'Unauthorized to cancel this reservation' });
-      }
-
-      if (reservation.status !== 'CONFIRMED' && reservation.status !== 'PENDING') {
-        return res.status(400).json({ error: `Cannot cancel a reservation in ${reservation.status} status` });
-      }
-
-      reservation.status = 'CANCELLED';
-      await reservation.save();
-
-      await AuditLog.create({
-        actorId: req.user.id,
-        actorName: req.user.name,
-        action: 'RESERVATION_CANCELLED',
-        targetType: 'RESERVATION',
-        targetId: id,
-        details: 'Reservation cancelled by user/custodian'
-      });
-
-      return res.json({ message: 'Reservation cancelled successfully' });
     }
 
     const db = getDb();
@@ -496,7 +512,8 @@ async function cancelReservation(req, res) {
       return res.status(404).json({ error: 'Reservation not found' });
     }
 
-    if (req.user.role === 'borrower' && reservation.userId !== req.user.id) {
+    const actorId = resolveSqliteUserId(db, req.user);
+    if (req.user.role === 'borrower' && reservation.userId !== actorId) {
       return res.status(403).json({ error: 'Unauthorized to cancel this reservation' });
     }
 
@@ -509,7 +526,7 @@ async function cancelReservation(req, res) {
     db.prepare(`
       INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
       VALUES (?, ?, 'RESERVATION_CANCELLED', 'RESERVATION', ?, 'Reservation cancelled by user/custodian')
-    `).run(req.user.id, req.user.name, id);
+    `).run(actorId, req.user.name, id);
 
     return res.json({ message: 'Reservation cancelled successfully' });
   } catch (error) {
@@ -523,48 +540,50 @@ async function checkoutReservation(req, res) {
     const { id } = req.params;
     const { checklist = {}, notes = '' } = req.body;
 
-    if (isMongo()) {
+    if (isMongo() && mongoose.Types.ObjectId.isValid(id)) {
       const reservation = await Reservation.findById(id);
-      if (!reservation) return res.status(404).json({ error: 'Reservation not found' });
+      if (reservation) {
+        if (reservation.status !== 'CONFIRMED') {
+          return res.status(400).json({ error: `Cannot checkout reservation with status '${reservation.status}'. Must be 'CONFIRMED'.` });
+        }
 
-      if (reservation.status !== 'CONFIRMED') {
-        return res.status(400).json({ error: `Cannot checkout reservation with status '${reservation.status}'. Must be 'CONFIRMED'.` });
+        const asset = await Asset.findById(reservation.assetId);
+        if (!asset) return res.status(404).json({ error: 'Associated asset not found' });
+
+        if (asset.status !== 'AVAILABLE' && asset.status !== 'RESERVED') {
+          return res.status(400).json({ error: `Asset cannot be checked out because its status is ${asset.status}` });
+        }
+
+        reservation.status = 'CHECKED_OUT';
+        reservation.checkedOutAt = new Date();
+        reservation.checkedOutBy = req.user.id;
+        reservation.checkoutChecklist = checklist;
+        reservation.checkoutNotes = notes;
+        await reservation.save();
+
+        asset.status = 'IN_USE';
+        await asset.save();
+
+        await AuditLog.create({
+          actorId: req.user.id,
+          actorName: req.user.name,
+          action: 'CUSTODY_HANDOVER',
+          targetType: 'RESERVATION',
+          targetId: id,
+          details: `Custody handed over for asset ${asset.assetTag} (${asset.name}). Checklist completed.`
+        });
+
+        return res.json({
+          message: 'Asset checked out successfully. Custody is now active.',
+          assetTag: asset.assetTag,
+          assetName: asset.name
+        });
       }
-
-      const asset = await Asset.findById(reservation.assetId);
-      if (!asset) return res.status(404).json({ error: 'Associated asset not found' });
-
-      if (asset.status !== 'AVAILABLE' && asset.status !== 'RESERVED') {
-        return res.status(400).json({ error: `Asset cannot be checked out because its status is ${asset.status}` });
-      }
-
-      reservation.status = 'CHECKED_OUT';
-      reservation.checkedOutAt = new Date();
-      reservation.checkedOutBy = req.user.id;
-      reservation.checkoutChecklist = checklist;
-      reservation.checkoutNotes = notes;
-      await reservation.save();
-
-      asset.status = 'IN_USE';
-      await asset.save();
-
-      await AuditLog.create({
-        actorId: req.user.id,
-        actorName: req.user.name,
-        action: 'CUSTODY_HANDOVER',
-        targetType: 'RESERVATION',
-        targetId: id,
-        details: `Custody handed over for asset ${asset.assetTag} (${asset.name}). Checklist completed.`
-      });
-
-      return res.json({
-        message: 'Asset checked out successfully. Custody is now active.',
-        assetTag: asset.assetTag,
-        assetName: asset.name
-      });
     }
 
     const db = getDb();
+    const actorId = resolveSqliteUserId(db, req.user);
+
     const checkoutTx = db.transaction(() => {
       const reservation = db.prepare('SELECT * FROM reservations WHERE id = ?').get(id);
       if (!reservation) throw new Error('Reservation not found');
@@ -583,7 +602,7 @@ async function checkoutReservation(req, res) {
             checkoutChecklist = ?,
             checkoutNotes = ?
         WHERE id = ?
-      `).run(now, req.user.id, JSON.stringify(checklist), notes, id);
+      `).run(now, actorId, JSON.stringify(checklist), notes, id);
 
       db.prepare("UPDATE assets SET status = 'IN_USE' WHERE id = ?").run(reservation.assetId);
 
@@ -591,7 +610,7 @@ async function checkoutReservation(req, res) {
         INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
         VALUES (?, ?, 'CUSTODY_HANDOVER', 'RESERVATION', ?, ?)
       `).run(
-        req.user.id,
+        actorId,
         req.user.name,
         id,
         `Custody handed over for asset ${asset.assetTag} (${asset.name}). Checklist completed.`
@@ -624,100 +643,103 @@ async function returnReservation(req, res) {
       severity = 'MEDIUM'
     } = req.body;
 
-    if (isMongo()) {
+    if (isMongo() && mongoose.Types.ObjectId.isValid(id)) {
       const reservation = await Reservation.findById(id);
-      if (!reservation) return res.status(404).json({ error: 'Reservation not found' });
-      if (reservation.status !== 'CHECKED_OUT' && reservation.status !== 'OVERDUE') {
-        return res.status(400).json({ error: `Cannot return reservation with status '${reservation.status}'. Must be 'CHECKED_OUT' or 'OVERDUE'.` });
-      }
-
-      const asset = await Asset.findById(reservation.assetId);
-      const borrower = await User.findById(reservation.userId);
-
-      const now = new Date();
-      const endTime = new Date(reservation.endTime);
-      let overdueHours = 0;
-      let overdueFee = 0.0;
-
-      if (now > endTime) {
-        overdueHours = Math.ceil((now - endTime) / (1000 * 60 * 60));
-        overdueFee = overdueHours * (asset.hourlyPenaltyRate || 15.0);
-      }
-
-      const parsedDamageFee = hasDamage ? Math.max(0, parseFloat(damageFee) || 0) : 0.0;
-      const totalFee = overdueFee + parsedDamageFee;
-      let penaltyStatus = totalFee > 0 ? 'ASSESSED' : 'NONE';
-
-      let newReservationStatus = hasDamage ? 'FLAGGED_DAMAGE' : 'RETURNED';
-      let newAssetStatus = hasDamage ? 'MAINTENANCE' : 'AVAILABLE';
-      let newConditionGrade = hasDamage ? 'DAMAGED' : (inspection.newConditionGrade || asset.conditionGrade);
-
-      let deduction = 0;
-      if (totalFee > 0 && borrower.depositBalance >= totalFee) {
-        deduction = totalFee;
-        penaltyStatus = 'PAID';
-        borrower.depositBalance -= deduction;
-        await borrower.save();
-      }
-
-      reservation.status = newReservationStatus;
-      reservation.returnedAt = now;
-      reservation.receivedBy = req.user.id;
-      reservation.returnInspection = inspection;
-      reservation.returnNotes = notes;
-      reservation.overduePenaltyFee = overdueFee;
-      reservation.damagePenaltyFee = parsedDamageFee;
-      reservation.penaltyStatus = penaltyStatus;
-      await reservation.save();
-
-      asset.status = newAssetStatus;
-      asset.conditionGrade = newConditionGrade;
-      await asset.save();
-
-      let maintenanceTicketId = null;
-      if (hasDamage) {
-        const ticket = await MaintenanceTicket.create({
-          assetId: asset._id,
-          reportedBy: req.user.id,
-          reservationId: reservation._id,
-          issueDescription: damageDescription || 'Damage detected during custodian return inspection',
-          severity: severity || 'MEDIUM',
-          status: 'OPEN',
-          estimatedRepairCost: parsedDamageFee,
-          resolutionNotes: `Reported on return inspection by custodian ${req.user.name}`
-        });
-        maintenanceTicketId = ticket._id.toString();
-      }
-
-      await AuditLog.create({
-        actorId: req.user.id,
-        actorName: req.user.name,
-        action: hasDamage ? 'RETURN_WITH_DAMAGE' : 'RETURN_CLEAN',
-        targetType: 'RESERVATION',
-        targetId: id,
-        details: `Return inspected for ${asset.assetTag}. Overdue Fee: $${overdueFee}, Damage Fee: $${parsedDamageFee}. Status: ${newReservationStatus}`
-      });
-
-      return res.json({
-        message: hasDamage
-          ? 'Asset returned with damage flagged. Asset moved to MAINTENANCE quarantine.'
-          : 'Asset returned in good condition and restocked to AVAILABLE.',
-        result: {
-          reservationId: id,
-          hasDamage,
-          overdueHours,
-          overdueFee,
-          damageFee: parsedDamageFee,
-          totalPenalty: totalFee,
-          deductedFromBalance: deduction,
-          penaltyStatus,
-          assetStatus: newAssetStatus,
-          maintenanceTicketId
+      if (reservation) {
+        if (reservation.status !== 'CHECKED_OUT' && reservation.status !== 'OVERDUE') {
+          return res.status(400).json({ error: `Cannot return reservation with status '${reservation.status}'. Must be 'CHECKED_OUT' or 'OVERDUE'.` });
         }
-      });
+
+        const asset = await Asset.findById(reservation.assetId);
+        const borrower = await User.findById(reservation.userId);
+
+        const now = new Date();
+        const endTime = new Date(reservation.endTime);
+        let overdueHours = 0;
+        let overdueFee = 0.0;
+
+        if (now > endTime) {
+          overdueHours = Math.ceil((now - endTime) / (1000 * 60 * 60));
+          overdueFee = overdueHours * (asset.hourlyPenaltyRate || 15.0);
+        }
+
+        const parsedDamageFee = hasDamage ? Math.max(0, parseFloat(damageFee) || 0) : 0.0;
+        const totalFee = overdueFee + parsedDamageFee;
+        let penaltyStatus = totalFee > 0 ? 'ASSESSED' : 'NONE';
+
+        let newReservationStatus = hasDamage ? 'FLAGGED_DAMAGE' : 'RETURNED';
+        let newAssetStatus = hasDamage ? 'MAINTENANCE' : 'AVAILABLE';
+        let newConditionGrade = hasDamage ? 'DAMAGED' : (inspection.newConditionGrade || asset.conditionGrade);
+
+        let deduction = 0;
+        if (totalFee > 0 && borrower && borrower.depositBalance >= totalFee) {
+          deduction = totalFee;
+          penaltyStatus = 'PAID';
+          borrower.depositBalance -= deduction;
+          await borrower.save();
+        }
+
+        reservation.status = newReservationStatus;
+        reservation.returnedAt = now;
+        reservation.receivedBy = req.user.id;
+        reservation.returnInspection = inspection;
+        reservation.returnNotes = notes;
+        reservation.overduePenaltyFee = overdueFee;
+        reservation.damagePenaltyFee = parsedDamageFee;
+        reservation.penaltyStatus = penaltyStatus;
+        await reservation.save();
+
+        asset.status = newAssetStatus;
+        asset.conditionGrade = newConditionGrade;
+        await asset.save();
+
+        let maintenanceTicketId = null;
+        if (hasDamage) {
+          const ticket = await MaintenanceTicket.create({
+            assetId: asset._id,
+            reportedBy: req.user.id,
+            reservationId: reservation._id,
+            issueDescription: damageDescription || 'Damage detected during custodian return inspection',
+            severity: severity || 'MEDIUM',
+            status: 'OPEN',
+            estimatedRepairCost: parsedDamageFee,
+            resolutionNotes: `Reported on return inspection by custodian ${req.user.name}`
+          });
+          maintenanceTicketId = ticket._id.toString();
+        }
+
+        await AuditLog.create({
+          actorId: req.user.id,
+          actorName: req.user.name,
+          action: hasDamage ? 'RETURN_WITH_DAMAGE' : 'RETURN_CLEAN',
+          targetType: 'RESERVATION',
+          targetId: id,
+          details: `Return inspected for ${asset.assetTag}. Overdue Fee: $${overdueFee}, Damage Fee: $${parsedDamageFee}. Status: ${newReservationStatus}`
+        });
+
+        return res.json({
+          message: hasDamage
+            ? 'Asset returned with damage flagged. Asset moved to MAINTENANCE quarantine.'
+            : 'Asset returned in good condition and restocked to AVAILABLE.',
+          result: {
+            reservationId: id,
+            hasDamage,
+            overdueHours,
+            overdueFee,
+            damageFee: parsedDamageFee,
+            totalPenalty: totalFee,
+            deductedFromBalance: deduction,
+            penaltyStatus,
+            assetStatus: newAssetStatus,
+            maintenanceTicketId
+          }
+        });
+      }
     }
 
     const db = getDb();
+    const actorId = resolveSqliteUserId(db, req.user);
+
     const returnTx = db.transaction(() => {
       const reservation = db.prepare('SELECT * FROM reservations WHERE id = ?').get(id);
       if (!reservation) throw new Error('Reservation not found');
@@ -747,7 +769,7 @@ async function returnReservation(req, res) {
       let newConditionGrade = hasDamage ? 'DAMAGED' : (inspection.newConditionGrade || asset.conditionGrade);
 
       let deduction = 0;
-      if (totalFee > 0 && borrower.depositBalance >= totalFee) {
+      if (totalFee > 0 && borrower && borrower.depositBalance >= totalFee) {
         deduction = totalFee;
         penaltyStatus = 'PAID';
         db.prepare('UPDATE users SET depositBalance = depositBalance - ? WHERE id = ?').run(deduction, borrower.id);
@@ -768,7 +790,7 @@ async function returnReservation(req, res) {
       `).run(
         newReservationStatus,
         nowIso,
-        req.user.id,
+        actorId,
         JSON.stringify(inspection),
         notes,
         overdueFee,
@@ -791,7 +813,7 @@ async function returnReservation(req, res) {
           VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?)
         `).run(
           asset.id,
-          req.user.id,
+          actorId,
           id,
           damageDescription || 'Damage detected during custodian return inspection',
           severity || 'MEDIUM',
@@ -805,7 +827,7 @@ async function returnReservation(req, res) {
         INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
         VALUES (?, ?, ?, 'RESERVATION', ?, ?)
       `).run(
-        req.user.id,
+        actorId,
         req.user.name,
         hasDamage ? 'RETURN_WITH_DAMAGE' : 'RETURN_CLEAN',
         id,
@@ -843,22 +865,23 @@ async function settlePenalty(req, res) {
   try {
     const { id } = req.params;
 
-    if (isMongo()) {
+    if (isMongo() && mongoose.Types.ObjectId.isValid(id)) {
       const reservation = await Reservation.findById(id);
-      if (!reservation) return res.status(404).json({ error: 'Reservation not found' });
-      reservation.penaltyStatus = 'PAID';
-      await reservation.save();
+      if (reservation) {
+        reservation.penaltyStatus = 'PAID';
+        await reservation.save();
 
-      await AuditLog.create({
-        actorId: req.user.id,
-        actorName: req.user.name,
-        action: 'PENALTY_SETTLED',
-        targetType: 'RESERVATION',
-        targetId: id,
-        details: 'Outstanding penalty fee was marked settled/paid.'
-      });
+        await AuditLog.create({
+          actorId: req.user.id,
+          actorName: req.user.name,
+          action: 'PENALTY_SETTLED',
+          targetType: 'RESERVATION',
+          targetId: id,
+          details: 'Outstanding penalty fee was marked settled/paid.'
+        });
 
-      return res.json({ message: 'Penalty settled successfully' });
+        return res.json({ message: 'Penalty settled successfully' });
+      }
     }
 
     const db = getDb();
@@ -867,12 +890,13 @@ async function settlePenalty(req, res) {
       return res.status(404).json({ error: 'Reservation not found' });
     }
 
+    const actorId = resolveSqliteUserId(db, req.user);
     db.prepare("UPDATE reservations SET penaltyStatus = 'PAID' WHERE id = ?").run(id);
 
     db.prepare(`
       INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
       VALUES (?, ?, 'PENALTY_SETTLED', 'RESERVATION', ?, 'Outstanding penalty fee was marked settled/paid.')
-    `).run(req.user.id, req.user.name, id);
+    `).run(actorId, req.user.name, id);
 
     return res.json({ message: 'Penalty settled successfully' });
   } catch (error) {

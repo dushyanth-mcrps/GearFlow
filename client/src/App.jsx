@@ -12,6 +12,18 @@ import { Loader2 } from 'lucide-react';
 function MainApp() {
   const { user, loading } = useAuth();
   const [activeTab, setActiveTab] = useState('catalog');
+  const [engineInfo, setEngineInfo] = useState('MongoDB Atlas / Mongoose');
+
+  React.useEffect(() => {
+    fetch('/api/health')
+      .then(r => r.json())
+      .then(d => {
+        if (d.databaseEngine) {
+          setEngineInfo(d.databaseEngine);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   if (loading) {
     return (
@@ -48,7 +60,7 @@ function MainApp() {
             <span>Academic & Enterprise Asset Custody Platform</span>
           </div>
           <div className="flex items-center space-x-4 text-[11px]">
-            <span>SQLite WAL • React 19 • Tailwind CSS • Express 5</span>
+            <span className="font-mono text-slate-400">Database Engine: <span className="text-indigo-400 font-semibold">{engineInfo}</span></span>
             <span className="text-emerald-400 font-mono font-semibold">● Production Ready</span>
           </div>
         </div>

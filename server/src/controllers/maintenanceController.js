@@ -8,6 +8,20 @@ function isMongo() {
   return mongoose.connection && mongoose.connection.readyState === 1;
 }
 
+function resolveSqliteUserId(db, reqUser) {
+  if (!reqUser) return 1;
+  if (reqUser.id && !isNaN(Number(reqUser.id))) {
+    const row = db.prepare('SELECT id FROM users WHERE id = ?').get(Number(reqUser.id));
+    if (row) return row.id;
+  }
+  if (reqUser.email) {
+    const byEmail = db.prepare('SELECT id FROM users WHERE email = ?').get(reqUser.email.toLowerCase().trim());
+    if (byEmail) return byEmail.id;
+  }
+  const fallback = db.prepare("SELECT id FROM users WHERE role IN ('custodian', 'admin') LIMIT 1").get();
+  return fallback ? fallback.id : 1;
+}
+
 async function getAllTickets(req, res) {
   try {
     const { status, severity, assetId } = req.query;
@@ -93,36 +107,37 @@ async function getTicketById(req, res) {
   try {
     const { id } = req.params;
 
-    if (isMongo()) {
+    if (isMongo() && mongoose.Types.ObjectId.isValid(id)) {
       const t = await MaintenanceTicket.findById(id)
         .populate('assetId')
         .populate('reportedBy', 'name email');
 
-      if (!t) return res.status(404).json({ error: 'Maintenance ticket not found' });
-      const asset = t.assetId || {};
-      return res.json({
-        ticket: {
-          id: t._id.toString(),
-          _id: t._id.toString(),
-          assetId: asset._id ? asset._id.toString() : t.assetId,
-          assetName: asset.name,
-          assetTag: asset.assetTag,
-          assetCategory: asset.category,
-          assetLocation: asset.location,
-          assetImage: asset.imageUrl,
-          reporterName: t.reportedBy?.name,
-          reporterEmail: t.reportedBy?.email,
-          reservationId: t.reservationId?.toString(),
-          issueDescription: t.issueDescription,
-          severity: t.severity,
-          status: t.status,
-          assignedTo: t.assignedTo,
-          estimatedRepairCost: t.estimatedRepairCost,
-          resolutionNotes: t.resolutionNotes,
-          resolvedAt: t.resolvedAt,
-          createdAt: t.createdAt
-        }
-      });
+      if (t) {
+        const asset = t.assetId || {};
+        return res.json({
+          ticket: {
+            id: t._id.toString(),
+            _id: t._id.toString(),
+            assetId: asset._id ? asset._id.toString() : t.assetId,
+            assetName: asset.name,
+            assetTag: asset.assetTag,
+            assetCategory: asset.category,
+            assetLocation: asset.location,
+            assetImage: asset.imageUrl,
+            reporterName: t.reportedBy?.name,
+            reporterEmail: t.reportedBy?.email,
+            reservationId: t.reservationId?.toString(),
+            issueDescription: t.issueDescription,
+            severity: t.severity,
+            status: t.status,
+            assignedTo: t.assignedTo,
+            estimatedRepairCost: t.estimatedRepairCost,
+            resolutionNotes: t.resolutionNotes,
+            resolvedAt: t.resolvedAt,
+            createdAt: t.createdAt
+          }
+        });
+      }
     }
 
     const db = getDb();
@@ -155,40 +170,41 @@ async function createTicket(req, res) {
       return res.status(400).json({ error: 'assetId and issueDescription are required' });
     }
 
-    if (isMongo()) {
+    if (isMongo() && mongoose.Types.ObjectId.isValid(assetId)) {
       const asset = await Asset.findById(assetId);
-      if (!asset) return res.status(404).json({ error: 'Asset not found' });
+      if (asset) {
+        const ticket = await MaintenanceTicket.create({
+          assetId,
+          reportedBy: req.user.id,
+          issueDescription: issueDescription.trim(),
+          severity,
+          status: 'OPEN',
+          assignedTo: assignedTo || 'Unassigned',
+          estimatedRepairCost: parseFloat(estimatedRepairCost) || 0.0
+        });
 
-      const ticket = await MaintenanceTicket.create({
-        assetId,
-        reportedBy: req.user.id,
-        issueDescription: issueDescription.trim(),
-        severity,
-        status: 'OPEN',
-        assignedTo: assignedTo || 'Unassigned',
-        estimatedRepairCost: parseFloat(estimatedRepairCost) || 0.0
-      });
+        asset.status = 'MAINTENANCE';
+        asset.conditionGrade = 'DAMAGED';
+        await asset.save();
 
-      asset.status = 'MAINTENANCE';
-      asset.conditionGrade = 'DAMAGED';
-      await asset.save();
+        await AuditLog.create({
+          actorId: req.user.id,
+          actorName: req.user.name,
+          action: 'MAINTENANCE_TICKET_OPENED',
+          targetType: 'MAINTENANCE',
+          targetId: ticket._id.toString(),
+          details: `Opened maintenance ticket #${ticket._id.toString()} for ${asset.assetTag}. Severity: ${severity}. Locked into quarantine.`
+        });
 
-      await AuditLog.create({
-        actorId: req.user.id,
-        actorName: req.user.name,
-        action: 'MAINTENANCE_TICKET_OPENED',
-        targetType: 'MAINTENANCE',
-        targetId: ticket._id.toString(),
-        details: `Opened maintenance ticket #${ticket._id.toString()} for ${asset.assetTag}. Severity: ${severity}. Locked into quarantine.`
-      });
-
-      return res.status(201).json({
-        message: 'Maintenance ticket created. Asset quarantined.',
-        ticketId: ticket._id.toString()
-      });
+        return res.status(201).json({
+          message: 'Maintenance ticket created. Asset quarantined.',
+          ticketId: ticket._id.toString()
+        });
+      }
     }
 
     const db = getDb();
+    const actorId = resolveSqliteUserId(db, req.user);
     const asset = db.prepare('SELECT id, assetTag, name FROM assets WHERE id = ?').get(assetId);
     if (!asset) {
       return res.status(404).json({ error: 'Asset not found' });
@@ -200,7 +216,7 @@ async function createTicket(req, res) {
         VALUES (?, ?, ?, ?, 'OPEN', ?, ?)
       `).run(
         assetId,
-        req.user.id,
+        actorId,
         issueDescription.trim(),
         severity,
         assignedTo || 'Unassigned',
@@ -214,7 +230,7 @@ async function createTicket(req, res) {
         INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
         VALUES (?, ?, 'MAINTENANCE_TICKET_OPENED', 'MAINTENANCE', ?, ?)
       `).run(
-        req.user.id,
+        actorId,
         req.user.name,
         ticketId,
         `Opened maintenance ticket #${ticketId} for ${asset.assetTag}. Severity: ${severity}. Locked into quarantine.`
@@ -246,48 +262,49 @@ async function updateTicket(req, res) {
       restoredConditionGrade = 'GOOD'
     } = req.body;
 
-    if (isMongo()) {
+    if (isMongo() && mongoose.Types.ObjectId.isValid(id)) {
       const ticket = await MaintenanceTicket.findById(id);
-      if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-
-      if (status) ticket.status = status;
-      if (assignedTo !== undefined) ticket.assignedTo = assignedTo;
-      if (estimatedRepairCost !== undefined) ticket.estimatedRepairCost = parseFloat(estimatedRepairCost);
-      if (resolutionNotes !== undefined) ticket.resolutionNotes = resolutionNotes;
-      if (status === 'RESOLVED' || status === 'CLOSED') {
-        ticket.resolvedAt = new Date();
-      }
-      await ticket.save();
-
-      let restoredTag = null;
-      if (restoreAsset || status === 'RESOLVED' || status === 'CLOSED') {
-        const asset = await Asset.findById(ticket.assetId);
-        if (asset) {
-          asset.status = 'AVAILABLE';
-          asset.conditionGrade = restoredConditionGrade;
-          await asset.save();
-          restoredTag = asset.assetTag;
+      if (ticket) {
+        if (status) ticket.status = status;
+        if (assignedTo !== undefined) ticket.assignedTo = assignedTo;
+        if (estimatedRepairCost !== undefined) ticket.estimatedRepairCost = parseFloat(estimatedRepairCost);
+        if (resolutionNotes !== undefined) ticket.resolutionNotes = resolutionNotes;
+        if (status === 'RESOLVED' || status === 'CLOSED') {
+          ticket.resolvedAt = new Date();
         }
+        await ticket.save();
+
+        let restoredTag = null;
+        if (restoreAsset || status === 'RESOLVED' || status === 'CLOSED') {
+          const asset = await Asset.findById(ticket.assetId);
+          if (asset) {
+            asset.status = 'AVAILABLE';
+            asset.conditionGrade = restoredConditionGrade;
+            await asset.save();
+            restoredTag = asset.assetTag;
+          }
+        }
+
+        await AuditLog.create({
+          actorId: req.user.id,
+          actorName: req.user.name,
+          action: 'MAINTENANCE_TICKET_UPDATED',
+          targetType: 'MAINTENANCE',
+          targetId: id,
+          details: `Updated ticket #${id}. Status: ${ticket.status}. ${restoredTag ? `Asset ${restoredTag} released from quarantine.` : ''}`
+        });
+
+        return res.json({
+          message: 'Ticket updated successfully',
+          ticketId: id,
+          status: ticket.status,
+          assetRestored: !!restoredTag
+        });
       }
-
-      await AuditLog.create({
-        actorId: req.user.id,
-        actorName: req.user.name,
-        action: 'MAINTENANCE_TICKET_UPDATED',
-        targetType: 'MAINTENANCE',
-        targetId: id,
-        details: `Updated ticket #${id}. Status: ${ticket.status}. ${restoredTag ? `Asset ${restoredTag} released from quarantine.` : ''}`
-      });
-
-      return res.json({
-        message: 'Ticket updated successfully',
-        ticketId: id,
-        status: ticket.status,
-        assetRestored: !!restoredTag
-      });
     }
 
     const db = getDb();
+    const actorId = resolveSqliteUserId(db, req.user);
     const ticket = db.prepare('SELECT * FROM maintenance_tickets WHERE id = ?').get(id);
     if (!ticket) {
       return res.status(404).json({ error: 'Ticket not found' });
@@ -326,7 +343,7 @@ async function updateTicket(req, res) {
         INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
         VALUES (?, ?, 'MAINTENANCE_TICKET_UPDATED', 'MAINTENANCE', ?, ?)
       `).run(
-        req.user.id,
+        actorId,
         req.user.name,
         id,
         `Updated ticket #${id}. Status: ${status || ticket.status}. ${restoredTag ? `Asset ${restoredTag} released from quarantine.` : ''}`

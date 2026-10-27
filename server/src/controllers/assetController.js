@@ -9,6 +9,20 @@ function isMongo() {
   return mongoose.connection && mongoose.connection.readyState === 1;
 }
 
+function resolveSqliteUserId(db, reqUser) {
+  if (!reqUser) return 1;
+  if (reqUser.id && !isNaN(Number(reqUser.id))) {
+    const row = db.prepare('SELECT id FROM users WHERE id = ?').get(Number(reqUser.id));
+    if (row) return row.id;
+  }
+  if (reqUser.email) {
+    const byEmail = db.prepare('SELECT id FROM users WHERE email = ?').get(reqUser.email.toLowerCase().trim());
+    if (byEmail) return byEmail.id;
+  }
+  const fallback = db.prepare("SELECT id FROM users WHERE role IN ('custodian', 'admin') LIMIT 1").get();
+  return fallback ? fallback.id : 1;
+}
+
 async function getAllAssets(req, res) {
   try {
     const { search, category, status, conditionGrade } = req.query;
@@ -296,6 +310,7 @@ async function createAsset(req, res) {
     }
 
     const db = getDb();
+    const actorId = resolveSqliteUserId(db, req.user);
     const existing = db.prepare('SELECT id FROM assets WHERE assetTag = ?').get(assetTag.trim());
     if (existing) {
       return res.status(409).json({ error: 'Asset with this assetTag already exists' });
@@ -321,7 +336,7 @@ async function createAsset(req, res) {
       INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
       VALUES (?, ?, 'ASSET_CREATED', 'ASSET', ?, ?)
     `).run(
-      req.user.id,
+      actorId,
       req.user.name,
       result.lastInsertRowid,
       `Created new asset ${assetTag.trim().toUpperCase()}: ${name.trim()}`
@@ -371,6 +386,7 @@ async function updateAsset(req, res) {
     }
 
     const db = getDb();
+    const actorId = resolveSqliteUserId(db, req.user);
     const existing = db.prepare('SELECT * FROM assets WHERE id = ?').get(id);
     if (!existing) {
       return res.status(404).json({ error: 'Asset not found' });
@@ -407,7 +423,7 @@ async function updateAsset(req, res) {
       INSERT INTO audit_logs (actorId, actorName, action, targetType, targetId, details)
       VALUES (?, ?, 'ASSET_UPDATED', 'ASSET', ?, ?)
     `).run(
-      req.user.id,
+      actorId,
       req.user.name,
       id,
       `Updated asset ${existing.assetTag}`
