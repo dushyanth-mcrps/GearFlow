@@ -122,17 +122,33 @@ stateDiagram-v2
 
 1. **Clone repository & Install dependencies**:
    ```bash
-   git clone <your-repo-url>
-   cd Project
+   git clone https://github.com/dushyanth-mcrps/GearFlow.git
+   cd GearFlow
    npm run setup
    ```
 
-2. **Seed the database with demo inventory and accounts**:
+2. **Configure Database & Environment**:
+   Copy `.env.example` to `server/.env` and paste your MongoDB URI (or leave blank to use the self-contained SQLite WAL engine):
    ```bash
+   cp server/.env.example server/.env
+   ```
+
+3. **Seed demo inventory and user accounts**:
+   ```bash
+   # For MongoDB:
+   npm run seed:mongo
+
+   # Or for offline SQLite:
    npm run seed
    ```
 
-3. **Start both backend and frontend concurrently**:
+4. **Verify System Integrity & Automated Tests**:
+   ```bash
+   npm test
+   npm run verify
+   ```
+
+5. **Start both backend and frontend concurrently**:
    ```bash
    npm start
    ```
