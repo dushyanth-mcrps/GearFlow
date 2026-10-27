@@ -1,10 +1,10 @@
 # ⚡ GearFlow — Equipment & Asset Custody Lifecycle Platform
 
-[![Live Deployment](https://img.shields.io/badge/Live%20Demo-Render%20Online-success?style=for-the-badge&logo=render)](https://gearflow-app.onrender.com)
+[![Live Deployment](https://img.shields.io/badge/Live%20Demo-Render%20Online-success?style=for-the-badge&logo=render)](https://gearflow-r9fh.onrender.com)
 [![GitHub Repository](https://img.shields.io/badge/GitHub-Repository-181717?style=for-the-badge&logo=github)](https://github.com/dushyanth-mcrps/GearFlow)
 [![Database](https://img.shields.io/badge/Database-MongoDB%20Atlas%20%2F%20SQLite-47A248?style=for-the-badge&logo=mongodb)](https://github.com/dushyanth-mcrps/GearFlow)
 
-> 🌐 **Live Deployed Application**: **[https://gearflow-app.onrender.com](https://gearflow-app.onrender.com)**  
+> 🌐 **Live Deployed Application**: **[https://gearflow-r9fh.onrender.com](https://gearflow-r9fh.onrender.com)**  
 > 🔗 **GitHub Repository**: **[https://github.com/dushyanth-mcrps/GearFlow](https://github.com/dushyanth-mcrps/GearFlow)**  
 > 💡 *Built with React 19, Node.js / Express 5, MongoDB Atlas (Mongoose) & SQLite (WAL Mode), Tailwind CSS.*
 
