@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "GearFlow - Enterprise & Academic Asset Lending Platform with Custody Lifecycle, Condition Auditing, and Overdue Penalty Engine",
   "scripts": {
-    "setup": "npm --prefix server install && npm --prefix client install",
+    "setup": "npm --prefix server install && npm --prefix client install --include=dev",
     "seed": "npm --prefix server run seed",
     "seed:mongo": "npm --prefix server run seed:mongo",
     "server": "npm --prefix server start",
